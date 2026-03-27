@@ -575,14 +575,14 @@ def _resolve_calls(
     review: Dict[str, Any],
     pitch_event: Optional[Dict[str, Any]],
 ) -> Tuple[str, str]:
-    final_call = _normalize_review_call(pitch_event)
+    original_call = _normalize_review_call(pitch_event)
     if not review.get("isOverturned"):
-        return final_call, final_call
-    if final_call == "Ball":
-        return "Called Strike", "Ball"
-    if final_call == "Called Strike":
+        return original_call, original_call
+    if original_call == "Ball":
         return "Ball", "Called Strike"
-    return "Unknown", final_call
+    if original_call == "Called Strike":
+        return "Called Strike", "Ball"
+    return original_call, "Unknown"
 
 
 def _normalize_review_call(pitch_event: Optional[Dict[str, Any]]) -> str:

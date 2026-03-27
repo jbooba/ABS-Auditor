@@ -14,7 +14,7 @@ from .publishers import Publisher
 from .render import render_challenge_card
 
 
-STATE_VERSION = 3
+STATE_VERSION = 4
 
 
 class AbsBotService:

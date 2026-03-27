@@ -32,7 +32,11 @@ FOOTER_MAX_CHARS = 54
 FOOTER_MAX_LINES = 4
 FOOTER_LINE_HEIGHT = 24
 PLOT_BG = "#f0ead6"
-BALL_RADIUS_PX = 14
+BALL_RADIUS_INCHES = 1.4375
+BALL_RADIUS_FEET = BALL_RADIUS_INCHES / 12.0
+BALL_RENDER_SCALE = 1.1
+BALL_RENDER_MIN_PX = 12.5
+BALL_RENDER_MAX_PX = 17.0
 
 
 def render_challenge_card(challenge: AbsChallenge, output_dir: Path) -> Path:
@@ -154,7 +158,7 @@ def _draw_strike_zone_png(
         px, py = to_px(challenge.pitch.px, challenge.pitch.pz)
         fill = "#d62828" if challenge.final_call == "Ball" else "#2a9d8f"
         ball_radius_px = BALL_RADIUS_FEET * min((right - left) / (x_max - x_min), (bottom - top) / (y_max - y_min))
-        ball_radius_px = max(11.0, min(16.0, ball_radius_px))
+        ball_radius_px = max(BALL_RENDER_MIN_PX, min(BALL_RENDER_MAX_PX, ball_radius_px * BALL_RENDER_SCALE))
         draw.ellipse(
             (px - ball_radius_px, py - ball_radius_px, px + ball_radius_px, py + ball_radius_px),
             fill=fill,
@@ -208,7 +212,7 @@ def _build_svg(challenge: AbsChallenge) -> str:
         pitch_x, pitch_y = to_px(challenge.pitch.px, challenge.pitch.pz)
         pitch_fill = "#d62828" if challenge.final_call == "Ball" else "#2a9d8f"
         ball_radius_px = BALL_RADIUS_FEET * min(PLOT_WIDTH / (x_max - x_min), PLOT_HEIGHT / (y_max - y_min))
-        ball_radius_px = max(11.0, min(16.0, ball_radius_px))
+        ball_radius_px = max(BALL_RENDER_MIN_PX, min(BALL_RENDER_MAX_PX, ball_radius_px * BALL_RENDER_SCALE))
         pitch_circle = (
             f'<circle cx="{pitch_x:.1f}" cy="{pitch_y:.1f}" r="{ball_radius_px:.1f}" fill="{pitch_fill}" stroke="{CARD_OUTLINE}" stroke-width="2" />'
         )
