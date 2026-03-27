@@ -1,1 +1,1 @@
-web: python -m abs_bot.main
+web: python railway_start.py

@@ -25,12 +25,18 @@ The app polls the MLB Stats API across a rolling UTC schedule window, detects co
 python -m abs_bot.main
 ```
 
+Process a saved game feed instead of polling live games:
+
+```powershell
+python -m abs_bot.main --sample-json "C:\Users\jesse\Downloads\statsapiexample.json" --once
+```
+
 ## Railway
 
 Recommended start command:
 
 ```text
-python -m abs_bot.main
+python railway_start.py
 ```
 
 The service binds to `PORT` and exposes:
@@ -41,7 +47,7 @@ The service binds to `PORT` and exposes:
 Suggested Railway setup:
 
 1. Deploy from GitHub.
-2. Keep the start command as `python -m abs_bot.main` if Railway does not detect it automatically.
+2. Keep the start command as `python railway_start.py` if Railway does not detect it automatically.
 3. Add a persistent volume and mount it at `/data` for the state file.
 4. Set `ABS_STATE_FILE=/data/state/seen_challenges.json`.
 5. Leave `ABS_OUTPUT_DIR` on ephemeral storage unless you explicitly want to keep artifacts.
@@ -74,4 +80,4 @@ Suggested Railway setup:
 - The displayed umpire rate is a challenge-specific upheld rate, not an all-pitches accuracy estimate.
 - The renderer writes PNG when Pillow is installed. If Pillow is unavailable, it falls back to SVG.
 - By default, service-mode artifacts are deleted after successful posting. Sample/manual runs still keep their rendered outputs.
-- A `Procfile` is included so platforms like Railway can run the service as `python -m abs_bot.main`.
+- A `Procfile` and `railway_start.py` launcher are included so Railway can start the service even if the repo contents end up one folder deeper than expected during deployment.
