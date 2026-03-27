@@ -12,6 +12,7 @@ ABS_REVIEW_TYPE = "MJ"
 BASE_ORDER = ("1B", "2B", "3B")
 BALL_RADIUS_INCHES = 1.4375
 BALL_RADIUS_FEET = BALL_RADIUS_INCHES / 12.0
+TEAM_TAG_MAX_WORDS = 4
 
 
 def extract_abs_challenges(feed: Dict[str, Any]) -> List[AbsChallenge]:
@@ -112,7 +113,7 @@ def format_post_text(challenge: AbsChallenge) -> str:
 
     lines = [
         f"ABS Challenge {challenge.outcome_label}",
-        f"{challenge.teams.matchup_label} | {challenge.inning_label}",
+        f"{_matchup_with_tags(challenge.teams)} | {challenge.inning_label}",
         f"Challenge by {challenge.challenger_name} ({challenge.challenge_team_abbrev})",
         f"Batter: {challenge.batter_name} | Pitcher: {challenge.pitcher_name}",
         challenge.home_plate_display,
@@ -132,6 +133,7 @@ def format_post_text(challenge: AbsChallenge) -> str:
 
 
 def format_bluesky_post_text(challenge: AbsChallenge) -> str:
+    matchup_text = _matchup_with_tags(challenge.teams)
     if challenge.challenger_name == challenge.batter_name:
         challenge_line = (
             f"{challenge.challenger_name} challenged on a "
@@ -145,7 +147,7 @@ def format_bluesky_post_text(challenge: AbsChallenge) -> str:
         )
 
     lines = [
-        f"ABS {challenge.outcome_label.lower()} the call in {challenge.teams.matchup_label} ({challenge.inning_label}).",
+        f"ABS {challenge.outcome_label.lower()} the call in {matchup_text} ({challenge.inning_label}).",
         challenge_line,
         (
             f"{_call_transition_text(challenge)} "
@@ -261,6 +263,21 @@ def _truncate_line(text: str, limit: int) -> str:
     if " " in trimmed:
         trimmed = trimmed.rsplit(" ", 1)[0]
     return f"{trimmed}..."
+
+
+def _matchup_with_tags(teams: GameTeams) -> str:
+    return f"{_team_hashtag(teams.away_name)} at {_team_hashtag(teams.home_name)}"
+
+
+def _team_hashtag(team_name: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9 ]+", "", team_name).strip()
+    if not cleaned:
+        return team_name
+    words = cleaned.split()
+    if not words:
+        return team_name
+    hashtag_words = words[:TEAM_TAG_MAX_WORDS]
+    return "#" + "".join(word.capitalize() for word in hashtag_words)
 
 
 def safe_text(value: Any) -> str:

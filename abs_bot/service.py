@@ -14,6 +14,9 @@ from .publishers import Publisher
 from .render import render_challenge_card
 
 
+STATE_VERSION = 2
+
+
 class AbsBotService:
     def __init__(
         self,
@@ -226,8 +229,11 @@ class AbsBotService:
         if not isinstance(payload, dict):
             return set(), {}
 
-        seen_payload = payload.get("seen_challenge_ids", [])
-        seen_ids = {str(item) for item in seen_payload if item is not None}
+        payload_version = int(payload.get("state_version", 0) or 0)
+        seen_ids: set[str] = set()
+        if payload_version == STATE_VERSION:
+            seen_payload = payload.get("seen_challenge_ids", [])
+            seen_ids = {str(item) for item in seen_payload if item is not None}
         umpire_payload = payload.get("umpire_stats", {})
         umpire_stats: dict[str, Dict[str, Any]] = {}
         if isinstance(umpire_payload, dict):
@@ -247,6 +253,7 @@ class AbsBotService:
         self.state_file.write_text(
             json.dumps(
                 {
+                    "state_version": STATE_VERSION,
                     "seen_challenge_ids": sorted(self.seen_challenge_ids),
                     "umpire_stats": self.umpire_stats,
                 },
