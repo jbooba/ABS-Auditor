@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import List
 from urllib.request import Request, urlopen
 
-from .challenges import format_alt_text
+from .challenges import format_alt_text, format_bluesky_post_text
 from .models import AbsChallenge
 
 
@@ -54,7 +54,7 @@ class BlueSkyPublisher(Publisher):
         with image_path.open("rb") as infile:
             blob = client.upload_blob(infile.read())
         client.send_post(
-            text=text,
+            text=format_bluesky_post_text(challenge),
             embed=models.AppBskyEmbedImages.Main(
                 images=[
                     models.AppBskyEmbedImages.Image(

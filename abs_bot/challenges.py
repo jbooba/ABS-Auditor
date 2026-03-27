@@ -131,6 +131,44 @@ def format_post_text(challenge: AbsChallenge) -> str:
     return "\n".join(lines)
 
 
+def format_bluesky_post_text(challenge: AbsChallenge) -> str:
+    if challenge.challenger_name == challenge.batter_name:
+        challenge_line = (
+            f"{challenge.challenger_name} challenged on a "
+            f"{challenge.pitch.count_display} {challenge.pitch.pitch_type.lower()}."
+        )
+    else:
+        challenge_line = (
+            f"{challenge.challenger_name} challenged on a "
+            f"{challenge.pitch.count_display} {challenge.pitch.pitch_type.lower()} "
+            f"to {challenge.batter_name}."
+        )
+
+    lines = [
+        f"ABS {challenge.outcome_label.lower()} the call in {challenge.teams.matchup_label} ({challenge.inning_label}).",
+        challenge_line,
+        (
+            f"{_call_transition_text(challenge)} "
+            f"{challenge.outs_display.capitalize()}, {challenge.runners_display}."
+        ),
+        f"Score: {challenge.score_display} | {challenge.home_plate_display}",
+    ]
+
+    pitch_note_parts = []
+    if challenge.pitch.start_speed is not None:
+        pitch_note_parts.append(f"{challenge.pitch.start_speed:.1f} mph")
+    if challenge.final_call == "Ball" and challenge.pitch.miss_display:
+        pitch_note_parts.append(f"Miss: {challenge.pitch.miss_display}")
+    if pitch_note_parts:
+        lines.append(" | ".join(pitch_note_parts))
+
+    result_line = _bluesky_result_line(challenge)
+    if result_line:
+        lines.append(result_line)
+
+    return _fit_bluesky_text(lines)
+
+
 def format_alt_text(challenge: AbsChallenge) -> str:
     miss_sentence = (
         f"The pitch missed the zone by {challenge.pitch.miss_display}. "
@@ -151,6 +189,78 @@ def format_alt_text(challenge: AbsChallenge) -> str:
         f"{at_bat_sentence}"
         f"Pitch tracked at px {challenge.pitch.px}, pz {challenge.pitch.pz}."
     )
+
+
+def _call_transition_text(challenge: AbsChallenge) -> str:
+    if challenge.changed_call:
+        return f"{challenge.original_call} -> {challenge.final_call}."
+    if challenge.final_call == "Ball":
+        return "Ball stays ball."
+    if challenge.final_call == "Called Strike":
+        return "Called strike stands."
+    return f"{challenge.final_call} stands."
+
+
+def _bluesky_result_line(challenge: AbsChallenge) -> str:
+    text = challenge.at_bat_result_display
+    if not text:
+        return ""
+    if "challenged" in text.lower() and ":" in text:
+        text = text.split(":", 1)[1].strip()
+    if text.startswith("Later in the at-bat: "):
+        return f"Later: {text.removeprefix('Later in the at-bat: ')}"
+    return f"Result: {text}"
+
+
+def _fit_bluesky_text(lines: list[str], limit: int = 300) -> str:
+    active_lines = [line for line in lines if line]
+    text = "\n".join(active_lines)
+    if len(text) <= limit:
+        return text
+
+    if active_lines and active_lines[-1].startswith("Result: "):
+        active_lines[-1] = _truncate_line(active_lines[-1], max(32, limit - _joined_length(active_lines[:-1]) - 1))
+        text = "\n".join(active_lines)
+        if len(text) <= limit:
+            return text
+
+    if active_lines and active_lines[-1].startswith("Later: "):
+        active_lines[-1] = _truncate_line(active_lines[-1], max(32, limit - _joined_length(active_lines[:-1]) - 1))
+        text = "\n".join(active_lines)
+        if len(text) <= limit:
+            return text
+
+    if len(active_lines) >= 4 and " | " in active_lines[3]:
+        score_text = f"Score: {active_lines[3].split('|', 1)[0].removeprefix('Score: ').strip()}"
+        active_lines[3] = score_text
+        text = "\n".join(active_lines)
+        if len(text) <= limit:
+            return text
+
+    if len(active_lines) >= 2:
+        active_lines[1] = _truncate_line(active_lines[1], 72)
+        text = "\n".join(active_lines)
+        if len(text) <= limit:
+            return text
+
+    return _truncate_line(text, limit)
+
+
+def _joined_length(lines: list[str]) -> int:
+    if not lines:
+        return 0
+    return len("\n".join(lines))
+
+
+def _truncate_line(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    if limit <= 3:
+        return text[:limit]
+    trimmed = text[: limit - 3].rstrip()
+    if " " in trimmed:
+        trimmed = trimmed.rsplit(" ", 1)[0]
+    return f"{trimmed}..."
 
 
 def safe_text(value: Any) -> str:
