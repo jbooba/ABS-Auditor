@@ -26,6 +26,7 @@ FOOTER_MAX_CHARS = 54
 FOOTER_MAX_LINES = 4
 FOOTER_LINE_HEIGHT = 24
 PLOT_BG = "#f0ead6"
+BALL_RADIUS_PX = 14
 
 
 def render_challenge_card(challenge: AbsChallenge, output_dir: Path) -> Path:
@@ -116,38 +117,40 @@ def _draw_strike_zone_png(
     body_font: "ImageFont.ImageFont",
     small_font: "ImageFont.ImageFont",
 ) -> None:  # pragma: no cover - visual output
-    x_min, x_max = -1.7, 1.7
-    y_min, y_max = 0.5, 4.5
     zone_half_width = 17.0 / 24.0
     zone_top_ft = challenge.pitch.strike_zone_top or 3.5
     zone_bottom_ft = challenge.pitch.strike_zone_bottom or 1.5
+    if zone_top_ft <= zone_bottom_ft:
+        zone_top_ft = 3.5
+        zone_bottom_ft = 1.5
 
     def to_px(x_value: float, y_value: float) -> Tuple[float, float]:
-        x_span = x_max - x_min
-        y_span = y_max - y_min
-        x = left + ((x_value - x_min) / x_span) * (right - left)
-        y = top + ((y_max - y_value) / y_span) * (bottom - top)
+        x_span = zone_half_width * 2
+        y_span = zone_top_ft - zone_bottom_ft
+        x = left + (((x_value + zone_half_width) / x_span) * (right - left))
+        y = top + (((zone_top_ft - y_value) / y_span) * (bottom - top))
         return x, y
 
-    for x in [-0.85, 0, 0.85]:
-        px1, py1 = to_px(x, y_min)
-        px2, py2 = to_px(x, y_max)
-        draw.line((px1, py1, px2, py2), fill="#d6d0ba", width=1)
+    width = right - left
+    height = bottom - top
+    for fraction in (1 / 3, 2 / 3):
+        grid_x = left + (width * fraction)
+        draw.line((grid_x, top, grid_x, bottom), fill="#d6d0ba", width=1)
 
-    for y in [1, 2, 3, 4]:
-        px1, py1 = to_px(x_min, y)
-        px2, py2 = to_px(x_max, y)
-        draw.line((px1, py1, px2, py2), fill="#d6d0ba", width=1)
-
-    sx1, sy1 = to_px(-zone_half_width, zone_top_ft)
-    sx2, sy2 = to_px(zone_half_width, zone_bottom_ft)
-    draw.rounded_rectangle((sx1, sy1, sx2, sy2), radius=10, outline=CARD_OUTLINE, width=2)
+    for fraction in (1 / 3, 2 / 3):
+        grid_y = top + (height * fraction)
+        draw.line((left, grid_y, right, grid_y), fill="#d6d0ba", width=1)
 
     if challenge.pitch.px is not None and challenge.pitch.pz is not None:
         px, py = to_px(challenge.pitch.px, challenge.pitch.pz)
         fill = "#d62828" if challenge.final_call == "Ball" else "#2a9d8f"
-        draw.ellipse((px - 11, py - 11, px + 11, py + 11), fill=fill, outline=CARD_OUTLINE, width=2)
-        draw.text((px + 16, py - 8), challenge.pitch.call_description, fill=CARD_OUTLINE, font=small_font)
+        draw.ellipse(
+            (px - BALL_RADIUS_PX, py - BALL_RADIUS_PX, px + BALL_RADIUS_PX, py + BALL_RADIUS_PX),
+            fill=fill,
+            outline=CARD_OUTLINE,
+            width=2,
+        )
+        draw.text((px + BALL_RADIUS_PX + 8, py - 10), challenge.pitch.call_description, fill=CARD_OUTLINE, font=small_font)
 
 
 def _draw_bases_diamond_png(
@@ -175,27 +178,26 @@ def _build_svg(challenge: AbsChallenge) -> str:
     zone_half_width = 17.0 / 24.0
     zone_top_ft = challenge.pitch.strike_zone_top or 3.5
     zone_bottom_ft = challenge.pitch.strike_zone_bottom or 1.5
+    if zone_top_ft <= zone_bottom_ft:
+        zone_top_ft = 3.5
+        zone_bottom_ft = 1.5
     plot_left, plot_top, plot_width, plot_height = 650, 110, 380, 510
-    x_min, x_max = -1.7, 1.7
-    y_min, y_max = 0.5, 4.5
 
     def to_px(x_value: float, y_value: float) -> Tuple[float, float]:
-        x = plot_left + ((x_value - x_min) / (x_max - x_min)) * plot_width
-        y = plot_top + ((y_max - y_value) / (y_max - y_min)) * plot_height
+        x = plot_left + (((x_value + zone_half_width) / (zone_half_width * 2)) * plot_width)
+        y = plot_top + (((zone_top_ft - y_value) / (zone_top_ft - zone_bottom_ft)) * plot_height)
         return x, y
 
-    sx1, sy1 = to_px(-zone_half_width, zone_top_ft)
-    sx2, sy2 = to_px(zone_half_width, zone_bottom_ft)
     pitch_circle = ""
     pitch_label = ""
     if challenge.pitch.px is not None and challenge.pitch.pz is not None:
         pitch_x, pitch_y = to_px(challenge.pitch.px, challenge.pitch.pz)
         pitch_fill = "#d62828" if challenge.final_call == "Ball" else "#2a9d8f"
         pitch_circle = (
-            f'<circle cx="{pitch_x:.1f}" cy="{pitch_y:.1f}" r="12" fill="{pitch_fill}" stroke="{CARD_OUTLINE}" stroke-width="2" />'
+            f'<circle cx="{pitch_x:.1f}" cy="{pitch_y:.1f}" r="{BALL_RADIUS_PX}" fill="{pitch_fill}" stroke="{CARD_OUTLINE}" stroke-width="2" />'
         )
         pitch_label = (
-            f'<text x="{pitch_x + 18:.1f}" y="{pitch_y + 6:.1f}" font-size="20" fill="{CARD_OUTLINE}">{escape(challenge.pitch.call_description)}</text>'
+            f'<text x="{pitch_x + BALL_RADIUS_PX + 10:.1f}" y="{pitch_y + 6:.1f}" font-size="20" fill="{CARD_OUTLINE}">{escape(challenge.pitch.call_description)}</text>'
         )
 
     speed = (
@@ -214,6 +216,14 @@ def _build_svg(challenge: AbsChallenge) -> str:
         for idx, line in enumerate(footer_lines)
     )
     bases_svg = _build_bases_diamond_svg(challenge, center_x=398, center_y=500, size=28, base_size=9)
+    grid_svg = "".join(
+        f'<line x1="{plot_left + (plot_width * fraction):.1f}" y1="{plot_top}" x2="{plot_left + (plot_width * fraction):.1f}" y2="{plot_top + plot_height}" stroke="#d6d0ba" stroke-width="1" />'
+        for fraction in (1 / 3, 2 / 3)
+    )
+    grid_svg += "".join(
+        f'<line x1="{plot_left}" y1="{plot_top + (plot_height * fraction):.1f}" x2="{plot_left + plot_width}" y2="{plot_top + (plot_height * fraction):.1f}" stroke="#d6d0ba" stroke-width="1" />'
+        for fraction in (1 / 3, 2 / 3)
+    )
     miss_svg = ""
     pitch_svg_y = 678
     if challenge.final_call == "Ball" and challenge.pitch.miss_display:
@@ -251,7 +261,7 @@ def _build_svg(challenge: AbsChallenge) -> str:
   {miss_svg}
   <text x="86" y="{pitch_svg_y}" font-size="22" fill="#ffffff">{escape(challenge.pitch.pitch_type)} | {escape(speed)}</text>
   <rect x="{plot_left}" y="{plot_top}" width="{plot_width}" height="{plot_height}" fill="none" stroke="{CARD_OUTLINE}" stroke-width="2" />
-  <rect x="{sx1:.1f}" y="{sy1:.1f}" width="{sx2 - sx1:.1f}" height="{sy2 - sy1:.1f}" rx="10" fill="none" stroke="{CARD_OUTLINE}" stroke-width="2" />
+  {grid_svg}
   {pitch_circle}
   {pitch_label}
   <text x="{FOOTER_CENTER_X}" y="{FOOTER_TOP_Y}" font-size="18" fill="{CARD_OUTLINE}" text-anchor="middle">{footer_tspans}</text>
@@ -283,6 +293,9 @@ def _load_font(size: int, *, bold: bool = False) -> "ImageFont.ImageFont":
     if bold:
         candidates.extend(
             [
+                "DejaVuSerif-Bold.ttf",
+                "LiberationSerif-Bold.ttf",
+                "DejaVuSans-Bold.ttf",
                 "C:/Windows/Fonts/georgiab.ttf",
                 "C:/Windows/Fonts/timesbd.ttf",
                 "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf",
@@ -292,6 +305,9 @@ def _load_font(size: int, *, bold: bool = False) -> "ImageFont.ImageFont":
     else:
         candidates.extend(
             [
+                "DejaVuSerif.ttf",
+                "LiberationSerif-Regular.ttf",
+                "DejaVuSans.ttf",
                 "C:/Windows/Fonts/georgia.ttf",
                 "C:/Windows/Fonts/times.ttf",
                 "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
@@ -300,14 +316,14 @@ def _load_font(size: int, *, bold: bool = False) -> "ImageFont.ImageFont":
         )
 
     for candidate in candidates:
-        path = Path(candidate)
-        if not path.exists():
-            continue
         try:
-            return ImageFont.truetype(str(path), size=size)
+            return ImageFont.truetype(candidate, size=size)
         except OSError:
             continue
-    return ImageFont.load_default()
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
 
 
 def _wrap_text(text: str, *, max_chars: int, max_lines: int) -> list[str]:

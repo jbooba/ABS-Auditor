@@ -14,7 +14,7 @@ from .publishers import Publisher
 from .render import render_challenge_card
 
 
-STATE_VERSION = 2
+STATE_VERSION = 3
 
 
 class AbsBotService:
@@ -234,9 +234,9 @@ class AbsBotService:
         if payload_version == STATE_VERSION:
             seen_payload = payload.get("seen_challenge_ids", [])
             seen_ids = {str(item) for item in seen_payload if item is not None}
-        umpire_payload = payload.get("umpire_stats", {})
         umpire_stats: dict[str, Dict[str, Any]] = {}
-        if isinstance(umpire_payload, dict):
+        umpire_payload = payload.get("umpire_stats", {})
+        if payload_version == STATE_VERSION and isinstance(umpire_payload, dict):
             for key, value in umpire_payload.items():
                 if not isinstance(value, dict):
                     continue
