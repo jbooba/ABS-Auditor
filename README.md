@@ -25,12 +25,6 @@ The app polls the MLB Stats API across a rolling UTC schedule window, detects co
 python -m abs_bot.main
 ```
 
-Process a saved game feed instead of polling live games:
-
-```powershell
-python -m abs_bot.main --sample-json "C:\Users\jesse\Downloads\statsapiexample.json" --once
-```
-
 ## Railway
 
 Recommended start command:
