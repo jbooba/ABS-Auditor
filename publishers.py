@@ -1,0 +1,168 @@
+from __future__ import annotations
+
+import json
+import mimetypes
+import os
+import uuid
+from pathlib import Path
+from typing import List
+from urllib.request import Request, urlopen
+
+from .challenges import format_alt_text
+from .models import AbsChallenge
+
+
+class Publisher:
+    def publish(self, challenge: AbsChallenge, text: str, image_path: Path) -> None:
+        raise NotImplementedError
+
+
+class DiscordWebhookPublisher(Publisher):
+    def __init__(self, webhook_url: str) -> None:
+        self.webhook_url = webhook_url
+
+    def publish(self, challenge: AbsChallenge, text: str, image_path: Path) -> None:
+        payload_json = json.dumps({"content": text})
+        body, content_type = _multipart_encode(
+            fields={"payload_json": payload_json},
+            file_field="files[0]",
+            file_path=image_path,
+        )
+        request = Request(
+            self.webhook_url,
+            data=body,
+            headers={"Content-Type": content_type, "User-Agent": "mlb-abs-bot/0.1"},
+            method="POST",
+        )
+        with urlopen(request, timeout=20) as response:
+            response.read()
+
+
+class BlueSkyPublisher(Publisher):
+    def __init__(self, handle: str, app_password: str) -> None:
+        self.handle = handle
+        self.app_password = app_password
+
+    def publish(self, challenge: AbsChallenge, text: str, image_path: Path) -> None:  # pragma: no cover - network integration
+        try:
+            from atproto import Client, models
+        except ImportError as exc:
+            raise RuntimeError("BlueSky publishing requires the 'atproto' package.") from exc
+
+        client = Client()
+        client.login(self.handle, self.app_password)
+        with image_path.open("rb") as infile:
+            blob = client.upload_blob(infile.read())
+        client.send_post(
+            text=text,
+            embed=models.AppBskyEmbedImages.Main(
+                images=[
+                    models.AppBskyEmbedImages.Image(
+                        image=blob.blob,
+                        alt=format_alt_text(challenge),
+                    )
+                ]
+            ),
+        )
+
+
+class XPublisher(Publisher):
+    def __init__(
+        self,
+        api_key: str,
+        api_secret: str,
+        access_token: str,
+        access_token_secret: str,
+    ) -> None:
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.access_token = access_token
+        self.access_token_secret = access_token_secret
+
+    def publish(self, challenge: AbsChallenge, text: str, image_path: Path) -> None:  # pragma: no cover - network integration
+        try:
+            import tweepy
+        except ImportError as exc:
+            raise RuntimeError("X publishing requires the 'tweepy' package.") from exc
+
+        auth = tweepy.OAuth1UserHandler(
+            self.api_key,
+            self.api_secret,
+            self.access_token,
+            self.access_token_secret,
+        )
+        api_v1 = tweepy.API(auth)
+        media = api_v1.media_upload(filename=str(image_path))
+        client = tweepy.Client(
+            consumer_key=self.api_key,
+            consumer_secret=self.api_secret,
+            access_token=self.access_token,
+            access_token_secret=self.access_token_secret,
+        )
+        client.create_tweet(text=text, media_ids=[media.media_id_string])
+
+
+def publishers_from_env() -> List[Publisher]:
+    publishers: List[Publisher] = []
+
+    discord_webhook = os.getenv("ABS_DISCORD_WEBHOOK_URL", "").strip()
+    if discord_webhook:
+        publishers.append(DiscordWebhookPublisher(discord_webhook))
+
+    bluesky_handle = os.getenv("ABS_BLUESKY_HANDLE", "").strip()
+    bluesky_password = os.getenv("ABS_BLUESKY_APP_PASSWORD", "").strip()
+    if bluesky_handle and bluesky_password:
+        publishers.append(BlueSkyPublisher(bluesky_handle, bluesky_password))
+
+    x_api_key = os.getenv("ABS_X_API_KEY", "").strip()
+    x_api_secret = os.getenv("ABS_X_API_SECRET", "").strip()
+    x_access_token = os.getenv("ABS_X_ACCESS_TOKEN", "").strip()
+    x_access_token_secret = os.getenv("ABS_X_ACCESS_TOKEN_SECRET", "").strip()
+    if all([x_api_key, x_api_secret, x_access_token, x_access_token_secret]):
+        publishers.append(
+            XPublisher(
+                api_key=x_api_key,
+                api_secret=x_api_secret,
+                access_token=x_access_token,
+                access_token_secret=x_access_token_secret,
+            )
+        )
+
+    return publishers
+
+
+def _multipart_encode(
+    *,
+    fields: dict[str, str],
+    file_field: str,
+    file_path: Path,
+) -> tuple[bytes, str]:
+    boundary = f"----absbot{uuid.uuid4().hex}"
+    chunks: List[bytes] = []
+
+    for name, value in fields.items():
+        chunks.extend(
+            [
+                f"--{boundary}\r\n".encode("utf-8"),
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("utf-8"),
+                value.encode("utf-8"),
+                b"\r\n",
+            ]
+        )
+
+    content_type = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
+    filename = file_path.name
+    chunks.extend(
+        [
+            f"--{boundary}\r\n".encode("utf-8"),
+            (
+                f'Content-Disposition: form-data; name="{file_field}"; filename="{filename}"\r\n'
+                f"Content-Type: {content_type}\r\n\r\n"
+            ).encode("utf-8"),
+            file_path.read_bytes(),
+            b"\r\n",
+            f"--{boundary}--\r\n".encode("utf-8"),
+        ]
+    )
+
+    return b"".join(chunks), f"multipart/form-data; boundary={boundary}"

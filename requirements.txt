@@ -1,0 +1,4 @@
+Pillow>=11.1.0
+atproto>=0.0.56
+tweepy>=4.14.0
+tzdata>=2025.2

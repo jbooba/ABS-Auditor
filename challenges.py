@@ -1,0 +1,553 @@
+from __future__ import annotations
+
+import html
+import math
+import re
+from typing import Any, Dict, List, Optional, Tuple
+
+from .models import AbsChallenge, ChallengePitch, GameTeams
+
+
+ABS_REVIEW_TYPE = "MJ"
+BASE_ORDER = ("1B", "2B", "3B")
+BALL_RADIUS_INCHES = 1.4375
+BALL_RADIUS_FEET = BALL_RADIUS_INCHES / 12.0
+
+
+def extract_abs_challenges(feed: Dict[str, Any]) -> List[AbsChallenge]:
+    teams = _extract_teams(feed)
+    home_plate_umpire_id, home_plate_umpire_name = _extract_home_plate_umpire(feed)
+    game_pk = int(feed.get("gamePk") or feed.get("gameData", {}).get("game", {}).get("pk") or 0)
+    game_status = (
+        feed.get("gameData", {})
+        .get("status", {})
+        .get("detailedState", "Unknown")
+    )
+    all_plays = feed.get("liveData", {}).get("plays", {}).get("allPlays", [])
+
+    challenges: List[AbsChallenge] = []
+    current_bases: dict[str, dict[str, Any]] = {}
+    current_away_score = 0
+    current_home_score = 0
+    current_outs = 0
+    current_half_key: tuple[Any, Any] | None = None
+
+    for play in all_plays:
+        about = play.get("about", {})
+        play_half_key = (about.get("inning"), about.get("halfInning"))
+        if play_half_key != current_half_key:
+            current_half_key = play_half_key
+            current_bases = {}
+            current_outs = 0
+
+        play_start_bases = dict(current_bases)
+        play_start_away_score = current_away_score
+        play_start_home_score = current_home_score
+        play_start_outs = current_outs
+
+        play_review = play.get("reviewDetails")
+        if _is_completed_abs_review(play_review):
+            pitch_event, selection_reason = _select_review_pitch(play, play_review)
+            challenges.append(
+                _build_challenge(
+                    game_pk=game_pk,
+                    game_status=game_status,
+                    teams=teams,
+                    play=play,
+                    review=play_review,
+                    pitch_event=pitch_event,
+                    selection_reason=selection_reason,
+                    play_start_bases=play_start_bases,
+                    play_start_away_score=play_start_away_score,
+                    play_start_home_score=play_start_home_score,
+                    play_start_outs=play_start_outs,
+                    home_plate_umpire_id=home_plate_umpire_id,
+                    home_plate_umpire_name=home_plate_umpire_name,
+                )
+            )
+        for event in play.get("playEvents", []):
+            event_review = event.get("reviewDetails")
+            if not _is_completed_abs_review(event_review):
+                continue
+            if play_review and _reviews_match(play_review, event_review):
+                continue
+            challenges.append(
+                _build_challenge(
+                    game_pk=game_pk,
+                    game_status=game_status,
+                    teams=teams,
+                    play=play,
+                    review=event_review,
+                    pitch_event=event,
+                    selection_reason="event_review",
+                    play_start_bases=play_start_bases,
+                    play_start_away_score=play_start_away_score,
+                    play_start_home_score=play_start_home_score,
+                    play_start_outs=play_start_outs,
+                    home_plate_umpire_id=home_plate_umpire_id,
+                    home_plate_umpire_name=home_plate_umpire_name,
+                )
+            )
+
+        current_bases = _extract_post_bases(play)
+        current_away_score = int(play.get("result", {}).get("awayScore", current_away_score))
+        current_home_score = int(play.get("result", {}).get("homeScore", current_home_score))
+        current_outs = int(play.get("count", {}).get("outs", current_outs))
+
+    return challenges
+
+
+def format_post_text(challenge: AbsChallenge) -> str:
+    speed = (
+        f"{challenge.pitch.start_speed:.1f} mph"
+        if challenge.pitch.start_speed is not None
+        else "speed unavailable"
+    )
+    location = []
+    if challenge.pitch.px is not None:
+        location.append(f"px {challenge.pitch.px:+.2f}")
+    if challenge.pitch.pz is not None:
+        location.append(f"pz {challenge.pitch.pz:.2f}")
+    location_text = ", ".join(location) if location else "tracking unavailable"
+
+    lines = [
+        f"ABS Challenge {challenge.outcome_label}",
+        f"{challenge.teams.matchup_label} | {challenge.inning_label}",
+        f"Challenge by {challenge.challenger_name} ({challenge.challenge_team_abbrev})",
+        f"Batter: {challenge.batter_name} | Pitcher: {challenge.pitcher_name}",
+        challenge.home_plate_display,
+        f"Situation: {challenge.pitch.count_display}, {challenge.outs_display}, {challenge.runners_display}",
+        f"Score: {challenge.score_display}",
+        f"Original call: {challenge.original_call}",
+        f"ABS result: {challenge.final_call}",
+        f"Pitch: {challenge.pitch.pitch_type} | {speed} | {location_text}",
+    ]
+    if challenge.umpire_challenge_summary:
+        lines.insert(5, challenge.umpire_challenge_summary)
+    if challenge.final_call == "Ball" and challenge.pitch.miss_display:
+        lines.append(f"Miss: {challenge.pitch.miss_display}")
+    if challenge.at_bat_result_display:
+        lines.append(challenge.at_bat_result_display)
+    return "\n".join(lines)
+
+
+def format_alt_text(challenge: AbsChallenge) -> str:
+    miss_sentence = (
+        f"The pitch missed the zone by {challenge.pitch.miss_display}. "
+        if challenge.final_call == "Ball" and challenge.pitch.miss_display
+        else ""
+    )
+    at_bat_sentence = f"{challenge.at_bat_result_display} " if challenge.at_bat_result_display else ""
+    return (
+        f"{challenge.teams.matchup_label} {challenge.inning_label}. "
+        f"ABS challenge by {challenge.challenger_name} of {challenge.challenge_team_name}. "
+        f"{challenge.home_plate_display}. "
+        f"Situation was {challenge.pitch.count_display}, {challenge.outs_display}, runners {challenge.runners_display}. "
+        f"Score was {challenge.score_display}. "
+        f"Original call {challenge.original_call}. "
+        f"Result {challenge.final_call}. "
+        f"{miss_sentence}"
+        f"{challenge.umpire_challenge_summary + '. ' if challenge.umpire_challenge_summary else ''}"
+        f"{at_bat_sentence}"
+        f"Pitch tracked at px {challenge.pitch.px}, pz {challenge.pitch.pz}."
+    )
+
+
+def safe_text(value: Any) -> str:
+    return html.escape("" if value is None else str(value))
+
+
+def _extract_teams(feed: Dict[str, Any]) -> GameTeams:
+    game_teams = feed.get("gameData", {}).get("teams", {})
+    home = game_teams.get("home", {})
+    away = game_teams.get("away", {})
+    return GameTeams(
+        home_id=int(home.get("id", 0)),
+        home_name=home.get("name", "Home"),
+        home_abbrev=home.get("abbreviation", "HOME"),
+        away_id=int(away.get("id", 0)),
+        away_name=away.get("name", "Away"),
+        away_abbrev=away.get("abbreviation", "AWAY"),
+    )
+
+
+def _extract_home_plate_umpire(feed: Dict[str, Any]) -> Tuple[Optional[int], str]:
+    officials = feed.get("liveData", {}).get("boxscore", {}).get("officials", [])
+    for official in officials:
+        if official.get("officialType") != "Home Plate":
+            continue
+        official_info = official.get("official", {})
+        return official_info.get("id"), official_info.get("fullName", "Unknown")
+    return None, ""
+
+
+def _is_completed_abs_review(review: Optional[Dict[str, Any]]) -> bool:
+    if not review:
+        return False
+    return review.get("reviewType") == ABS_REVIEW_TYPE and review.get("inProgress") is False
+
+
+def _select_review_pitch(
+    play: Dict[str, Any],
+    review: Dict[str, Any],
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    events = play.get("playEvents", [])
+    matching_review_events = [
+        event
+        for event in events
+        if _reviews_match(review, event.get("reviewDetails"))
+    ]
+    if matching_review_events:
+        return matching_review_events[-1], "matching_event_review"
+
+    flagged_events = []
+    for event in events:
+        if not event.get("isPitch") or not event.get("details", {}).get("hasReview"):
+            continue
+        event_review = event.get("reviewDetails")
+        if event_review and not _reviews_match(review, event_review):
+            continue
+        flagged_events.append(event)
+    if flagged_events:
+        return flagged_events[-1], "details_has_review"
+
+    pitch_events = [event for event in events if event.get("isPitch")]
+    if pitch_events:
+        return pitch_events[-1], "fallback_last_pitch"
+
+    return None, "no_pitch_event"
+
+
+def _reviews_match(left: Optional[Dict[str, Any]], right: Optional[Dict[str, Any]]) -> bool:
+    if not left or not right:
+        return False
+    left_player = left.get("player", {}).get("id")
+    right_player = right.get("player", {}).get("id")
+    return (
+        left.get("reviewType") == right.get("reviewType")
+        and left.get("challengeTeamId") == right.get("challengeTeamId")
+        and left.get("isOverturned") == right.get("isOverturned")
+        and left_player == right_player
+    )
+
+
+def _build_challenge(
+    *,
+    game_pk: int,
+    game_status: str,
+    teams: GameTeams,
+    play: Dict[str, Any],
+    review: Dict[str, Any],
+    pitch_event: Optional[Dict[str, Any]],
+    selection_reason: str,
+    play_start_bases: dict[str, dict[str, Any]],
+    play_start_away_score: int,
+    play_start_home_score: int,
+    play_start_outs: int,
+    home_plate_umpire_id: Optional[int],
+    home_plate_umpire_name: str,
+) -> AbsChallenge:
+    about = play.get("about", {})
+    matchup = play.get("matchup", {})
+    challenge_team_id = review.get("challengeTeamId")
+    original_call, final_call = _resolve_calls(review, pitch_event)
+
+    pitch_details = pitch_event.get("details", {}) if pitch_event else {}
+    pitch_data = pitch_event.get("pitchData", {}) if pitch_event else {}
+    coordinates = pitch_data.get("coordinates", {}) if pitch_event else {}
+    pitch_type = pitch_details.get("type", {}).get("description", "Unknown")
+    balls_before, strikes_before = _pre_pitch_count(play, pitch_event)
+    miss_distance_inches, miss_description = _pitch_miss_details(pitch_event)
+    outs_before, away_score_before, home_score_before, runners_on_base = _situation_before_pitch(
+        play,
+        pitch_event,
+        play_start_bases,
+        play_start_outs,
+        play_start_away_score,
+        play_start_home_score,
+    )
+
+    pitch = ChallengePitch(
+        event_index=pitch_event.get("index") if pitch_event else None,
+        play_id=pitch_event.get("playId") if pitch_event else None,
+        pitch_number=pitch_event.get("pitchNumber") if pitch_event else None,
+        selection_reason=selection_reason,
+        balls_before=balls_before,
+        strikes_before=strikes_before,
+        call_code=_extract_call_code(pitch_event),
+        call_description=_plot_call_label(final_call),
+        pitch_type=pitch_type,
+        start_speed=pitch_data.get("startSpeed"),
+        px=coordinates.get("pX"),
+        pz=coordinates.get("pZ"),
+        strike_zone_top=pitch_data.get("strikeZoneTop"),
+        strike_zone_bottom=pitch_data.get("strikeZoneBottom"),
+        zone_number=pitch_data.get("zone"),
+        miss_distance_inches=miss_distance_inches,
+        miss_description=miss_description,
+    )
+
+    inning = int(about.get("inning", 0))
+    is_top_inning = bool(about.get("isTopInning"))
+    inning_label = f"{'Top' if is_top_inning else 'Bot'} {inning}"
+    challenger_name = (
+        review.get("player", {}).get("fullName")
+        or teams.team_name(challenge_team_id)
+    )
+    challenge_event_id = pitch.play_id or str(about.get("atBatIndex"))
+    challenge_id = f"{game_pk}:{about.get('atBatIndex')}:{challenge_event_id}:{int(bool(review.get('isOverturned')))}"
+    pitch_ended_at_bat = _pitch_ended_at_bat(play, pitch_event)
+    result_description = _clean_result_description(play.get("result", {}).get("description", ""))
+    if not pitch_ended_at_bat:
+        result_description = _strip_challenge_intro(result_description)
+
+    return AbsChallenge(
+        challenge_id=challenge_id,
+        game_pk=game_pk,
+        game_status=game_status,
+        teams=teams,
+        at_bat_index=int(about.get("atBatIndex", 0)),
+        inning=inning,
+        is_top_inning=is_top_inning,
+        inning_label=inning_label,
+        half_inning=about.get("halfInning", ""),
+        batter_name=matchup.get("batter", {}).get("fullName", "Unknown Batter"),
+        pitcher_name=matchup.get("pitcher", {}).get("fullName", "Unknown Pitcher"),
+        challenger_name=challenger_name,
+        challenge_team_id=challenge_team_id,
+        challenge_team_name=teams.team_name(challenge_team_id),
+        challenge_team_abbrev=teams.team_abbrev(challenge_team_id),
+        away_score_before=away_score_before,
+        home_score_before=home_score_before,
+        outs_before=outs_before,
+        runners_on_base=tuple(runners_on_base),
+        review_type=review.get("reviewType", ""),
+        is_overturned=bool(review.get("isOverturned")),
+        in_progress=bool(review.get("inProgress")),
+        result_description=result_description,
+        pitch_ended_at_bat=pitch_ended_at_bat,
+        original_call=original_call,
+        final_call=final_call,
+        pitch=pitch,
+        play_end_time=play.get("playEndTime") or (pitch_event.get("endTime") if pitch_event else None),
+        home_plate_umpire_id=home_plate_umpire_id,
+        home_plate_umpire_name=home_plate_umpire_name,
+    )
+
+
+def _extract_call_code(pitch_event: Optional[Dict[str, Any]]) -> str:
+    if not pitch_event:
+        return ""
+    details = pitch_event.get("details", {})
+    return details.get("call", {}).get("code") or details.get("code", "")
+
+
+def _pre_pitch_count(
+    play: Dict[str, Any],
+    pitch_event: Optional[Dict[str, Any]],
+) -> Tuple[Optional[int], Optional[int]]:
+    if not pitch_event:
+        return None, None
+
+    balls = 0
+    strikes = 0
+    for event in play.get("playEvents", []):
+        if event is pitch_event:
+            return balls, strikes
+        if event.get("isPitch"):
+            count = event.get("count", {})
+            balls = count.get("balls", balls)
+            strikes = count.get("strikes", strikes)
+
+    return balls, strikes
+
+
+def _situation_before_pitch(
+    play: Dict[str, Any],
+    pitch_event: Optional[Dict[str, Any]],
+    play_start_bases: dict[str, dict[str, Any]],
+    play_start_outs: int,
+    play_start_away_score: int,
+    play_start_home_score: int,
+) -> Tuple[int, int, int, list[str]]:
+    target_index = pitch_event.get("index") if pitch_event else None
+    if target_index is None:
+        return (
+            play_start_outs,
+            play_start_away_score,
+            play_start_home_score,
+            [base for base in BASE_ORDER if base in play_start_bases],
+        )
+
+    bases = {base: dict(info) for base, info in play_start_bases.items()}
+    outs = play_start_outs
+    away_score = play_start_away_score
+    home_score = play_start_home_score
+    batting_team_is_away = bool(play.get("about", {}).get("isTopInning"))
+
+    for runner in play.get("runners", []):
+        details = runner.get("details", {})
+        play_index = details.get("playIndex")
+        if play_index is None or play_index >= target_index:
+            continue
+
+        runner_info = details.get("runner", {})
+        runner_id = runner_info.get("id")
+        movement = runner.get("movement", {})
+        _remove_runner_from_bases(bases, runner_id)
+
+        end_base = movement.get("end")
+        if end_base in BASE_ORDER:
+            bases[end_base] = {
+                "id": runner_id,
+                "name": runner_info.get("fullName", "Runner"),
+            }
+
+        if movement.get("isOut"):
+            outs += 1
+
+        if details.get("isScoringEvent"):
+            if batting_team_is_away:
+                away_score += 1
+            else:
+                home_score += 1
+
+    return outs, away_score, home_score, [base for base in BASE_ORDER if base in bases]
+
+
+def _remove_runner_from_bases(bases: dict[str, dict[str, Any]], runner_id: Any) -> None:
+    if runner_id is None:
+        return
+    for base, info in list(bases.items()):
+        if info.get("id") == runner_id:
+            bases.pop(base, None)
+
+
+def _extract_post_bases(play: Dict[str, Any]) -> dict[str, dict[str, Any]]:
+    matchup = play.get("matchup", {})
+    post_base_fields = {
+        "1B": matchup.get("postOnFirst"),
+        "2B": matchup.get("postOnSecond"),
+        "3B": matchup.get("postOnThird"),
+    }
+    bases: dict[str, dict[str, Any]] = {}
+    for base, runner in post_base_fields.items():
+        if not runner:
+            continue
+        bases[base] = {
+            "id": runner.get("id"),
+            "name": runner.get("fullName", "Runner"),
+        }
+    return bases
+
+
+def _resolve_calls(
+    review: Dict[str, Any],
+    pitch_event: Optional[Dict[str, Any]],
+) -> Tuple[str, str]:
+    final_call = _normalize_review_call(pitch_event)
+    if not review.get("isOverturned"):
+        return final_call, final_call
+    if final_call == "Ball":
+        return "Called Strike", "Ball"
+    if final_call == "Called Strike":
+        return "Ball", "Called Strike"
+    return "Unknown", final_call
+
+
+def _normalize_review_call(pitch_event: Optional[Dict[str, Any]]) -> str:
+    if not pitch_event:
+        return "Unknown"
+
+    details = pitch_event.get("details", {})
+    call = details.get("call", {})
+    description = (call.get("description") or details.get("description") or "").strip()
+    description_lower = description.lower()
+    code = (call.get("code") or details.get("code") or "").upper()
+
+    if code == "B" or description_lower.startswith("ball") or details.get("isBall"):
+        return "Ball"
+    if code == "C" or "called strike" in description_lower:
+        return "Called Strike"
+    if details.get("isStrike") and "swing" not in description_lower and "foul" not in description_lower:
+        return "Called Strike"
+    return description or "Unknown"
+
+
+def _plot_call_label(call: str) -> str:
+    if call == "Called Strike":
+        return "Strike"
+    return call
+
+
+def _pitch_miss_details(
+    pitch_event: Optional[Dict[str, Any]],
+) -> Tuple[Optional[float], Optional[str]]:
+    if not pitch_event:
+        return None, None
+
+    pitch_data = pitch_event.get("pitchData", {})
+    coordinates = pitch_data.get("coordinates", {})
+    px = coordinates.get("pX")
+    pz = coordinates.get("pZ")
+    zone_top = pitch_data.get("strikeZoneTop")
+    zone_bottom = pitch_data.get("strikeZoneBottom")
+    if None in {px, pz, zone_top, zone_bottom}:
+        return None, None
+
+    zone_half_width = 17.0 / 24.0
+    left_edge = -zone_half_width - BALL_RADIUS_FEET
+    right_edge = zone_half_width + BALL_RADIUS_FEET
+
+    horizontal_miss = 0.0
+    if px < left_edge:
+        horizontal_miss = left_edge - px
+    elif px > right_edge:
+        horizontal_miss = px - right_edge
+
+    vertical_miss = 0.0
+    vertical_description: Optional[str] = None
+    if pz < zone_bottom - BALL_RADIUS_FEET:
+        vertical_miss = (zone_bottom - BALL_RADIUS_FEET) - pz
+        vertical_description = "low"
+    elif pz > zone_top + BALL_RADIUS_FEET:
+        vertical_miss = pz - (zone_top + BALL_RADIUS_FEET)
+        vertical_description = "high"
+
+    if horizontal_miss == 0 and vertical_miss == 0:
+        return None, None
+
+    distance_inches = math.hypot(horizontal_miss, vertical_miss) * 12.0
+    if horizontal_miss > 0 and vertical_miss > 0:
+        description = "off corner"
+    elif vertical_description:
+        description = vertical_description
+    else:
+        description = "off edge"
+    return distance_inches, description
+
+
+def _pitch_ended_at_bat(
+    play: Dict[str, Any],
+    pitch_event: Optional[Dict[str, Any]],
+) -> bool:
+    if not pitch_event:
+        return False
+    pitch_events = [event for event in play.get("playEvents", []) if event.get("isPitch")]
+    if not pitch_events:
+        return False
+    return pitch_event is pitch_events[-1]
+
+
+def _clean_result_description(text: str) -> str:
+    cleaned = re.sub(r"\s*\([^)]*\)", "", text)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    cleaned = re.sub(r"\s+([,.:;!?])", r"\1", cleaned)
+    return cleaned
+
+
+def _strip_challenge_intro(text: str) -> str:
+    lowered = text.lower()
+    if "challenged" in lowered and ":" in text:
+        return text.split(":", 1)[1].strip()
+    return text
