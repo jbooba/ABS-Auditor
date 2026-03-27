@@ -48,6 +48,8 @@ class ChallengePitch:
     pz: Optional[float]
     strike_zone_top: Optional[float]
     strike_zone_bottom: Optional[float]
+    normalized_zone_top: Optional[float]
+    normalized_zone_bottom: Optional[float]
     zone_number: Optional[int]
     miss_distance_inches: Optional[float]
     miss_description: Optional[str]
@@ -66,8 +68,16 @@ class ChallengePitch:
         if 0 < distance < 0.1:
             distance = 0.1
         if self.miss_description:
-            return f"{distance:.1f} in {self.miss_description}"
-        return f"{distance:.1f} in"
+            return f"~{distance:.1f} in {self.miss_description}"
+        return f"~{distance:.1f} in"
+
+    @property
+    def display_zone_top(self) -> Optional[float]:
+        return self.normalized_zone_top or self.strike_zone_top
+
+    @property
+    def display_zone_bottom(self) -> Optional[float]:
+        return self.normalized_zone_bottom or self.strike_zone_bottom
 
 
 @dataclass(frozen=True)
@@ -100,6 +110,7 @@ class AbsChallenge:
     final_call: str
     pitch: ChallengePitch
     play_end_time: Optional[str]
+    batter_height_inches: Optional[float] = None
     home_plate_umpire_id: Optional[int] = None
     home_plate_umpire_name: str = ""
     umpire_challenge_total: Optional[int] = None

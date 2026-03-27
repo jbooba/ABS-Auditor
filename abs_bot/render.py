@@ -14,12 +14,17 @@ except ImportError:  # pragma: no cover - fallback path
     PIL_AVAILABLE = False
 
 
-CARD_WIDTH = 1200
-CARD_HEIGHT = 800
+OUTPUT_SCALE = 2
+CANVAS_WIDTH = 1200
+CANVAS_HEIGHT = 800
+CARD_WIDTH = CANVAS_WIDTH * OUTPUT_SCALE
+CARD_HEIGHT = CANVAS_HEIGHT * OUTPUT_SCALE
 CARD_OUTLINE = "#13293d"
 CARD_BG = "#fffaf2"
 CARD_ACCENT = "#fca311"
 CARD_MUTED = "#d9e2ec"
+SVG_FONT_FAMILY = "'Noto Serif', 'DejaVu Serif', Georgia, serif"
+FONT_DIR = Path(__file__).resolve().parent / "assets" / "fonts"
 PLOT_LEFT = 700
 PLOT_TOP = 110
 PLOT_WIDTH = 310
@@ -32,11 +37,14 @@ FOOTER_MAX_CHARS = 54
 FOOTER_MAX_LINES = 4
 FOOTER_LINE_HEIGHT = 24
 PLOT_BG = "#f0ead6"
-BALL_RADIUS_INCHES = 1.4375
+PLATE_WIDTH_INCHES = 17.0
+BASEBALL_DIAMETER_INCHES = 2.89
+BALL_RADIUS_INCHES = BASEBALL_DIAMETER_INCHES / 2.0
 BALL_RADIUS_FEET = BALL_RADIUS_INCHES / 12.0
-BALL_RENDER_SCALE = 1.1
-BALL_RENDER_MIN_PX = 12.5
-BALL_RENDER_MAX_PX = 17.0
+ZONE_WIDTH_TARGET_RATIO = 0.74
+ZONE_HEIGHT_TARGET_RATIO = 0.68
+ZONE_CENTER_Y_RATIO = 0.42
+PERSPECTIVE_BAND_HEIGHT = 38
 
 
 def render_challenge_card(challenge: AbsChallenge, output_dir: Path) -> Path:
@@ -57,14 +65,14 @@ def _artifact_stem(challenge: AbsChallenge) -> str:
 
 
 def _render_png(challenge: AbsChallenge, output_path: Path) -> None:  # pragma: no cover - visual output
-    image = Image.new("RGB", (CARD_WIDTH, CARD_HEIGHT), "#f5f1e8")
+    image = Image.new("RGB", (CANVAS_WIDTH, CANVAS_HEIGHT), "#f5f1e8")
     draw = ImageDraw.Draw(image)
 
     title_font = _load_font(28, bold=True)
     body_font = _load_font(22)
     small_font = _load_font(18)
 
-    draw.rounded_rectangle((32, 32, CARD_WIDTH - 32, CARD_HEIGHT - 32), radius=28, fill=CARD_BG, outline=CARD_OUTLINE, width=4)
+    draw.rounded_rectangle((32, 32, CANVAS_WIDTH - 32, CANVAS_HEIGHT - 32), radius=28, fill=CARD_BG, outline=CARD_OUTLINE, width=4)
     draw.rounded_rectangle((58, 58, 500, 742), radius=20, fill=CARD_OUTLINE)
     draw.rounded_rectangle((535, 58, 1142, 742), radius=20, fill=PLOT_BG)
 
@@ -102,8 +110,7 @@ def _render_png(challenge: AbsChallenge, output_path: Path) -> None:  # pragma: 
         pitch_line_y = 637
     draw.text((86, pitch_line_y), pitch_line, fill="#fefefe", font=body_font)
 
-    draw.rectangle((PLOT_LEFT, PLOT_TOP, PLOT_RIGHT, PLOT_BOTTOM), outline=CARD_OUTLINE, width=2)
-    _draw_strike_zone_png(draw, challenge, PLOT_LEFT, PLOT_TOP, PLOT_RIGHT, PLOT_BOTTOM, body_font, small_font)
+    _draw_strike_zone_png(draw, challenge, PLOT_LEFT, PLOT_TOP, PLOT_RIGHT, PLOT_BOTTOM, small_font)
     _draw_centered_footer_png(
         draw,
         challenge.at_bat_result_display,
@@ -111,6 +118,10 @@ def _render_png(challenge: AbsChallenge, output_path: Path) -> None:  # pragma: 
         top_y=FOOTER_TOP_Y,
         font=small_font,
     )
+
+    if OUTPUT_SCALE != 1:
+        resampling = getattr(Image, "Resampling", Image)
+        image = image.resize((CARD_WIDTH, CARD_HEIGHT), resample=resampling.LANCZOS)
 
     image.save(output_path, format="PNG")
 
@@ -122,50 +133,33 @@ def _draw_strike_zone_png(
     top: int,
     right: int,
     bottom: int,
-    body_font: "ImageFont.ImageFont",
     small_font: "ImageFont.ImageFont",
 ) -> None:  # pragma: no cover - visual output
-    zone_half_width, zone_top_ft, zone_bottom_ft, x_min, x_max, y_min, y_max = _strike_zone_geometry(challenge)
-
-    def to_px(x_value: float, y_value: float) -> Tuple[float, float]:
-        return _to_plot_px(
-            x_value,
-            y_value,
-            left=left,
-            top=top,
-            width=right - left,
-            height=bottom - top,
-            x_min=x_min,
-            x_max=x_max,
-            y_min=y_min,
-            y_max=y_max,
-        )
-
-    zone_height = zone_top_ft - zone_bottom_ft
-    for zone_x in (-zone_half_width / 3, zone_half_width / 3):
-        grid_x, _ = to_px(zone_x, zone_bottom_ft)
-        draw.line((grid_x, top, grid_x, bottom), fill="#d6d0ba", width=1)
-
-    for zone_y in (zone_bottom_ft + (zone_height / 3), zone_bottom_ft + ((zone_height * 2) / 3)):
-        _, grid_y = to_px(-zone_half_width, zone_y)
-        draw.line((left, grid_y, right, grid_y), fill="#d6d0ba", width=1)
-
-    sx1, sy1 = to_px(-zone_half_width, zone_top_ft)
-    sx2, sy2 = to_px(zone_half_width, zone_bottom_ft)
+    sx1, sy1, sx2, sy2, px_per_inch, zone_top_ft, zone_bottom_ft = _zone_layout(challenge)
     draw.rounded_rectangle((sx1, sy1, sx2, sy2), radius=10, outline=CARD_OUTLINE, width=2)
+    _draw_plot_home_plate_png(draw, sx1, sx2)
 
     if challenge.pitch.px is not None and challenge.pitch.pz is not None:
-        px, py = to_px(challenge.pitch.px, challenge.pitch.pz)
+        zone_center_x = (sx1 + sx2) / 2.0
+        zone_bottom_y = sy2
+        px = zone_center_x + (challenge.pitch.px * 12.0 * px_per_inch)
+        py = zone_bottom_y - ((challenge.pitch.pz - zone_bottom_ft) * 12.0 * px_per_inch)
         fill = "#d62828" if challenge.final_call == "Ball" else "#2a9d8f"
-        ball_radius_px = BALL_RADIUS_FEET * min((right - left) / (x_max - x_min), (bottom - top) / (y_max - y_min))
-        ball_radius_px = max(BALL_RENDER_MIN_PX, min(BALL_RENDER_MAX_PX, ball_radius_px * BALL_RENDER_SCALE))
+        ball_radius_px = (BASEBALL_DIAMETER_INCHES * px_per_inch) / 2.0
         draw.ellipse(
             (px - ball_radius_px, py - ball_radius_px, px + ball_radius_px, py + ball_radius_px),
             fill=fill,
             outline=CARD_OUTLINE,
             width=2,
         )
-        draw.text((px + ball_radius_px + 8, py - 10), challenge.pitch.call_description, fill=CARD_OUTLINE, font=small_font)
+        label_text = challenge.pitch.call_description
+        label_bbox = draw.textbbox((0, 0), label_text, font=small_font)
+        label_width = label_bbox[2] - label_bbox[0]
+        if px > (PLOT_LEFT + (PLOT_WIDTH * 0.62)):
+            label_x = px - ball_radius_px - 10 - label_width
+        else:
+            label_x = px + ball_radius_px + 8
+        draw.text((label_x, py - 10), label_text, fill=CARD_OUTLINE, font=small_font)
 
 
 def _draw_bases_diamond_png(
@@ -190,34 +184,28 @@ def _draw_bases_diamond_png(
 
 
 def _build_svg(challenge: AbsChallenge) -> str:
-    zone_half_width, zone_top_ft, zone_bottom_ft, x_min, x_max, y_min, y_max = _strike_zone_geometry(challenge)
-
-    def to_px(x_value: float, y_value: float) -> Tuple[float, float]:
-        return _to_plot_px(
-            x_value,
-            y_value,
-            left=PLOT_LEFT,
-            top=PLOT_TOP,
-            width=PLOT_WIDTH,
-            height=PLOT_HEIGHT,
-            x_min=x_min,
-            x_max=x_max,
-            y_min=y_min,
-            y_max=y_max,
-        )
+    sx1, sy1, sx2, sy2, px_per_inch, _, zone_bottom_ft = _zone_layout(challenge)
+    home_plate_svg = _build_plot_home_plate_svg(sx1, sx2)
 
     pitch_circle = ""
     pitch_label = ""
     if challenge.pitch.px is not None and challenge.pitch.pz is not None:
-        pitch_x, pitch_y = to_px(challenge.pitch.px, challenge.pitch.pz)
+        zone_center_x = (sx1 + sx2) / 2.0
+        zone_bottom_y = sy2
+        pitch_x = zone_center_x + (challenge.pitch.px * 12.0 * px_per_inch)
+        pitch_y = zone_bottom_y - ((challenge.pitch.pz - zone_bottom_ft) * 12.0 * px_per_inch)
         pitch_fill = "#d62828" if challenge.final_call == "Ball" else "#2a9d8f"
-        ball_radius_px = BALL_RADIUS_FEET * min(PLOT_WIDTH / (x_max - x_min), PLOT_HEIGHT / (y_max - y_min))
-        ball_radius_px = max(BALL_RENDER_MIN_PX, min(BALL_RENDER_MAX_PX, ball_radius_px * BALL_RENDER_SCALE))
+        ball_radius_px = (BASEBALL_DIAMETER_INCHES * px_per_inch) / 2.0
+        label_anchor = "start"
+        label_x = pitch_x + ball_radius_px + 10
+        if pitch_x > (PLOT_LEFT + (PLOT_WIDTH * 0.62)):
+            label_anchor = "end"
+            label_x = pitch_x - ball_radius_px - 10
         pitch_circle = (
             f'<circle cx="{pitch_x:.1f}" cy="{pitch_y:.1f}" r="{ball_radius_px:.1f}" fill="{pitch_fill}" stroke="{CARD_OUTLINE}" stroke-width="2" />'
         )
         pitch_label = (
-            f'<text x="{pitch_x + ball_radius_px + 10:.1f}" y="{pitch_y + 6:.1f}" font-size="20" fill="{CARD_OUTLINE}">{escape(challenge.pitch.call_description)}</text>'
+            f'<text x="{label_x:.1f}" y="{pitch_y + 6:.1f}" font-size="20" fill="{CARD_OUTLINE}" text-anchor="{label_anchor}">{escape(challenge.pitch.call_description)}</text>'
         )
 
     speed = (
@@ -236,17 +224,6 @@ def _build_svg(challenge: AbsChallenge) -> str:
         for idx, line in enumerate(footer_lines)
     )
     bases_svg = _build_bases_diamond_svg(challenge, center_x=398, center_y=500, size=28, base_size=9)
-    sx1, sy1 = to_px(-zone_half_width, zone_top_ft)
-    sx2, sy2 = to_px(zone_half_width, zone_bottom_ft)
-    zone_height = zone_top_ft - zone_bottom_ft
-    grid_svg = "".join(
-        f'<line x1="{to_px(zone_x, zone_bottom_ft)[0]:.1f}" y1="{PLOT_TOP}" x2="{to_px(zone_x, zone_bottom_ft)[0]:.1f}" y2="{PLOT_BOTTOM}" stroke="#d6d0ba" stroke-width="1" />'
-        for zone_x in (-zone_half_width / 3, zone_half_width / 3)
-    )
-    grid_svg += "".join(
-        f'<line x1="{PLOT_LEFT}" y1="{to_px(-zone_half_width, zone_y)[1]:.1f}" x2="{PLOT_RIGHT}" y2="{to_px(-zone_half_width, zone_y)[1]:.1f}" stroke="#d6d0ba" stroke-width="1" />'
-        for zone_y in (zone_bottom_ft + (zone_height / 3), zone_bottom_ft + ((zone_height * 2) / 3))
-    )
     miss_svg = ""
     pitch_svg_y = 678
     if challenge.final_call == "Ball" and challenge.pitch.miss_display:
@@ -262,8 +239,8 @@ def _build_svg(challenge: AbsChallenge) -> str:
             f'<text x="86" y="432" font-size="18" fill="{CARD_MUTED}">{escape(challenge.umpire_challenge_summary)}</text>'
         )
 
-    return f"""<svg xmlns="http://www.w3.org/2000/svg" width="{CARD_WIDTH}" height="{CARD_HEIGHT}" viewBox="0 0 {CARD_WIDTH} {CARD_HEIGHT}">
-  <rect width="{CARD_WIDTH}" height="{CARD_HEIGHT}" fill="#f5f1e8" />
+    return f"""<svg xmlns="http://www.w3.org/2000/svg" width="{CARD_WIDTH}" height="{CARD_HEIGHT}" viewBox="0 0 {CANVAS_WIDTH} {CANVAS_HEIGHT}" style="font-family: {SVG_FONT_FAMILY};">
+  <rect width="{CANVAS_WIDTH}" height="{CANVAS_HEIGHT}" fill="#f5f1e8" />
   <rect x="32" y="32" width="1136" height="736" rx="28" fill="{CARD_BG}" stroke="{CARD_OUTLINE}" stroke-width="4" />
   <rect x="58" y="58" width="442" height="684" rx="20" fill="{CARD_OUTLINE}" />
   <rect x="535" y="58" width="607" height="684" rx="20" fill="{PLOT_BG}" />
@@ -283,9 +260,8 @@ def _build_svg(challenge: AbsChallenge) -> str:
   <text x="86" y="618" font-size="22" fill="{outcome_fill if challenge.changed_call else '#9ad1d4'}">ABS: {escape(challenge.final_call)}</text>
   {miss_svg}
   <text x="86" y="{pitch_svg_y}" font-size="22" fill="#ffffff">{escape(challenge.pitch.pitch_type)} | {escape(speed)}</text>
-  <rect x="{PLOT_LEFT}" y="{PLOT_TOP}" width="{PLOT_WIDTH}" height="{PLOT_HEIGHT}" fill="none" stroke="{CARD_OUTLINE}" stroke-width="2" />
-  {grid_svg}
   <rect x="{sx1:.1f}" y="{sy1:.1f}" width="{sx2 - sx1:.1f}" height="{sy2 - sy1:.1f}" rx="10" fill="none" stroke="{CARD_OUTLINE}" stroke-width="2" />
+  {home_plate_svg}
   {pitch_circle}
   {pitch_label}
   <text x="{FOOTER_CENTER_X}" y="{FOOTER_TOP_Y}" font-size="18" fill="{CARD_OUTLINE}" text-anchor="middle">{footer_tspans}</text>
@@ -293,45 +269,87 @@ def _build_svg(challenge: AbsChallenge) -> str:
 """
 
 
-def _strike_zone_geometry(challenge: AbsChallenge) -> tuple[float, float, float, float, float, float, float]:
-    zone_half_width = 17.0 / 24.0
-    zone_top_ft = challenge.pitch.strike_zone_top or 3.5
-    zone_bottom_ft = challenge.pitch.strike_zone_bottom or 1.5
+def _strike_zone_geometry(challenge: AbsChallenge) -> tuple[float, float, float]:
+    zone_half_width = PLATE_WIDTH_INCHES / 24.0
+    zone_top_ft = challenge.pitch.display_zone_top or 3.5
+    zone_bottom_ft = challenge.pitch.display_zone_bottom or 1.5
     if zone_top_ft <= zone_bottom_ft:
         zone_top_ft = 3.5
         zone_bottom_ft = 1.5
-
-    x_min = -zone_half_width - 0.60
-    x_max = zone_half_width + 0.60
-    y_min = zone_bottom_ft - 0.70
-    y_max = zone_top_ft + 0.70
-
-    if challenge.pitch.px is not None:
-        x_min = min(x_min, challenge.pitch.px - BALL_RADIUS_FEET - 0.10)
-        x_max = max(x_max, challenge.pitch.px + BALL_RADIUS_FEET + 0.10)
-    if challenge.pitch.pz is not None:
-        y_min = min(y_min, challenge.pitch.pz - BALL_RADIUS_FEET - 0.10)
-        y_max = max(y_max, challenge.pitch.pz + BALL_RADIUS_FEET + 0.10)
-
-    return zone_half_width, zone_top_ft, zone_bottom_ft, x_min, x_max, y_min, y_max
+    return zone_half_width, zone_top_ft, zone_bottom_ft
 
 
-def _to_plot_px(
-    x_value: float,
-    y_value: float,
-    *,
-    left: int,
-    top: int,
-    width: int,
-    height: int,
-    x_min: float,
-    x_max: float,
-    y_min: float,
-    y_max: float,
-) -> tuple[float, float]:
-    x = left + ((x_value - x_min) / (x_max - x_min)) * width
-    y = top + ((y_max - y_value) / (y_max - y_min)) * height
-    return x, y
+def _zone_layout(challenge: AbsChallenge) -> tuple[float, float, float, float, float, float, float]:
+    zone_half_width, zone_top_ft, zone_bottom_ft = _strike_zone_geometry(challenge)
+    zone_width_inches = PLATE_WIDTH_INCHES
+    zone_height_inches = (zone_top_ft - zone_bottom_ft) * 12.0
+    px_per_inch = min(
+        (PLOT_WIDTH * ZONE_WIDTH_TARGET_RATIO) / zone_width_inches,
+        (PLOT_HEIGHT * ZONE_HEIGHT_TARGET_RATIO) / zone_height_inches,
+    )
+
+    zone_width_px = zone_width_inches * px_per_inch
+    zone_height_px = zone_height_inches * px_per_inch
+    zone_center_x = PLOT_LEFT + (PLOT_WIDTH / 2.0)
+    zone_center_y = PLOT_TOP + (PLOT_HEIGHT * ZONE_CENTER_Y_RATIO)
+    sx1 = zone_center_x - (zone_width_px / 2.0)
+    sy1 = zone_center_y - (zone_height_px / 2.0)
+    sx2 = zone_center_x + (zone_width_px / 2.0)
+    sy2 = zone_center_y + (zone_height_px / 2.0)
+    return sx1, sy1, sx2, sy2, px_per_inch, zone_top_ft, zone_bottom_ft
+
+
+def _draw_plot_home_plate_png(
+    draw: "ImageDraw.ImageDraw",
+    zone_left: float,
+    zone_right: float,
+) -> None:  # pragma: no cover - visual output
+    band, plate = _plot_home_plate_geometry(zone_left, zone_right)
+    draw.rounded_rectangle(band, radius=6, fill="#dad9d7")
+    draw.polygon(plate, fill="#faf7f0", outline=CARD_OUTLINE)
+
+
+def _build_plot_home_plate_svg(zone_left: float, zone_right: float) -> str:
+    band, plate = _plot_home_plate_geometry(zone_left, zone_right)
+    band_left, band_top, band_right, band_bottom = band
+    plate_points = " ".join(f"{x:.1f},{y:.1f}" for x, y in plate)
+    return (
+        f'<rect x="{band_left:.1f}" y="{band_top:.1f}" width="{band_right - band_left:.1f}" '
+        f'height="{band_bottom - band_top:.1f}" rx="6" fill="#dad9d7" />'
+        f'<polygon points="{plate_points}" fill="#faf7f0" stroke="{CARD_OUTLINE}" stroke-width="1.5" />'
+    )
+
+
+def _plot_home_plate_geometry(
+    zone_left: float,
+    zone_right: float,
+) -> tuple[tuple[float, float, float, float], tuple[tuple[float, float], ...]]:
+    zone_width = zone_right - zone_left
+    center_x = (zone_left + zone_right) / 2.0
+    band_left = PLOT_LEFT + 16
+    band_right = PLOT_RIGHT - 16
+    band_top = min(PLOT_BOTTOM + 6, FOOTER_TOP_Y - 42)
+    band_bottom = band_top + PERSPECTIVE_BAND_HEIGHT
+    band = (
+        band_left,
+        band_top,
+        band_right,
+        band_bottom,
+    )
+
+    plate_top_width = zone_width
+    plate_shoulder_width = plate_top_width * 0.95
+    plate_top_y = band_top + 3
+    plate_shoulder_y = band_top + (PERSPECTIVE_BAND_HEIGHT * 0.46)
+    plate_bottom_y = band_bottom - 2
+    plate = (
+        (center_x - (plate_top_width / 2.0), plate_top_y),
+        (center_x + (plate_top_width / 2.0), plate_top_y),
+        (center_x + (plate_shoulder_width / 2.0), plate_shoulder_y),
+        (center_x, plate_bottom_y),
+        (center_x - (plate_shoulder_width / 2.0), plate_shoulder_y),
+    )
+    return band, plate
 
 
 def _draw_centered_footer_png(
@@ -358,6 +376,8 @@ def _load_font(size: int, *, bold: bool = False) -> "ImageFont.ImageFont":
     if bold:
         candidates.extend(
             [
+                str(FONT_DIR / "NotoSerif-Bold.ttf"),
+                str(FONT_DIR / "DejaVuSerif-Bold.ttf"),
                 "DejaVuSerif-Bold.ttf",
                 "LiberationSerif-Bold.ttf",
                 "DejaVuSans-Bold.ttf",
@@ -370,6 +390,8 @@ def _load_font(size: int, *, bold: bool = False) -> "ImageFont.ImageFont":
     else:
         candidates.extend(
             [
+                str(FONT_DIR / "NotoSerif-Regular.ttf"),
+                str(FONT_DIR / "DejaVuSerif.ttf"),
                 "DejaVuSerif.ttf",
                 "LiberationSerif-Regular.ttf",
                 "DejaVuSans.ttf",

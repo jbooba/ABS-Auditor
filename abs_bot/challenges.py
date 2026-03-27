@@ -12,8 +12,13 @@ ABS_REVIEW_TYPE = "MJ"
 BASE_ORDER = ("1B", "2B", "3B")
 BALL_RADIUS_INCHES = 1.4375
 BALL_RADIUS_FEET = BALL_RADIUS_INCHES / 12.0
+BATTER_ZONE_TOP_PCT = 0.535
+BATTER_ZONE_BOTTOM_PCT = 0.270
+
+
 def extract_abs_challenges(feed: Dict[str, Any]) -> List[AbsChallenge]:
     teams = _extract_teams(feed)
+    player_heights = _extract_player_heights(feed)
     home_plate_umpire_id, home_plate_umpire_name = _extract_home_plate_umpire(feed)
     game_pk = int(feed.get("gamePk") or feed.get("gameData", {}).get("game", {}).get("pk") or 0)
     game_status = (
@@ -59,6 +64,7 @@ def extract_abs_challenges(feed: Dict[str, Any]) -> List[AbsChallenge]:
                     play_start_away_score=play_start_away_score,
                     play_start_home_score=play_start_home_score,
                     play_start_outs=play_start_outs,
+                    player_heights=player_heights,
                     home_plate_umpire_id=home_plate_umpire_id,
                     home_plate_umpire_name=home_plate_umpire_name,
                 )
@@ -82,6 +88,7 @@ def extract_abs_challenges(feed: Dict[str, Any]) -> List[AbsChallenge]:
                     play_start_away_score=play_start_away_score,
                     play_start_home_score=play_start_home_score,
                     play_start_outs=play_start_outs,
+                    player_heights=player_heights,
                     home_plate_umpire_id=home_plate_umpire_id,
                     home_plate_umpire_name=home_plate_umpire_name,
                 )
@@ -311,6 +318,23 @@ def _extract_home_plate_umpire(feed: Dict[str, Any]) -> Tuple[Optional[int], str
     return None, ""
 
 
+def _extract_player_heights(feed: Dict[str, Any]) -> Dict[int, float]:
+    players = feed.get("gameData", {}).get("players", {})
+    heights: Dict[int, float] = {}
+    if not isinstance(players, dict):
+        return heights
+
+    for player in players.values():
+        if not isinstance(player, dict):
+            continue
+        player_id = player.get("id")
+        height_inches = _parse_height_to_inches(player.get("height"))
+        if player_id is None or height_inches is None:
+            continue
+        heights[int(player_id)] = height_inches
+    return heights
+
+
 def _is_completed_abs_review(review: Optional[Dict[str, Any]]) -> bool:
     if not review:
         return False
@@ -374,13 +398,17 @@ def _build_challenge(
     play_start_away_score: int,
     play_start_home_score: int,
     play_start_outs: int,
+    player_heights: Dict[int, float],
     home_plate_umpire_id: Optional[int],
     home_plate_umpire_name: str,
 ) -> AbsChallenge:
     about = play.get("about", {})
     matchup = play.get("matchup", {})
+    batter_id = matchup.get("batter", {}).get("id")
     challenge_team_id = review.get("challengeTeamId")
     batting_team_id = teams.away_id if about.get("isTopInning") else teams.home_id
+    batter_height_inches = _lookup_batter_height_inches(player_heights, batter_id)
+    normalized_zone_top, normalized_zone_bottom = _height_based_zone_bounds(batter_height_inches)
     original_call, final_call = _resolve_calls(
         review,
         pitch_event,
@@ -393,7 +421,11 @@ def _build_challenge(
     coordinates = pitch_data.get("coordinates", {}) if pitch_event else {}
     pitch_type = pitch_details.get("type", {}).get("description", "Unknown")
     balls_before, strikes_before = _pre_pitch_count(play, pitch_event)
-    miss_distance_inches, miss_description = _pitch_miss_details(pitch_event)
+    miss_distance_inches, miss_description = _pitch_miss_details(
+        pitch_event,
+        zone_top=normalized_zone_top or pitch_data.get("strikeZoneTop"),
+        zone_bottom=normalized_zone_bottom or pitch_data.get("strikeZoneBottom"),
+    )
     outs_before, away_score_before, home_score_before, runners_on_base = _situation_before_pitch(
         play,
         pitch_event,
@@ -418,6 +450,8 @@ def _build_challenge(
         pz=coordinates.get("pZ"),
         strike_zone_top=pitch_data.get("strikeZoneTop"),
         strike_zone_bottom=pitch_data.get("strikeZoneBottom"),
+        normalized_zone_top=normalized_zone_top,
+        normalized_zone_bottom=normalized_zone_bottom,
         zone_number=pitch_data.get("zone"),
         miss_distance_inches=miss_distance_inches,
         miss_description=miss_description,
@@ -466,6 +500,7 @@ def _build_challenge(
         final_call=final_call,
         pitch=pitch,
         play_end_time=play.get("playEndTime") or (pitch_event.get("endTime") if pitch_event else None),
+        batter_height_inches=batter_height_inches,
         home_plate_umpire_id=home_plate_umpire_id,
         home_plate_umpire_name=home_plate_umpire_name,
     )
@@ -648,6 +683,9 @@ def _plot_call_label(call: str) -> str:
 
 def _pitch_miss_details(
     pitch_event: Optional[Dict[str, Any]],
+    *,
+    zone_top: Optional[float],
+    zone_bottom: Optional[float],
 ) -> Tuple[Optional[float], Optional[str]]:
     if not pitch_event:
         return None, None
@@ -656,8 +694,6 @@ def _pitch_miss_details(
     coordinates = pitch_data.get("coordinates", {})
     px = coordinates.get("pX")
     pz = coordinates.get("pZ")
-    zone_top = pitch_data.get("strikeZoneTop")
-    zone_bottom = pitch_data.get("strikeZoneBottom")
     if None in {px, pz, zone_top, zone_bottom}:
         return None, None
 
@@ -717,3 +753,32 @@ def _strip_challenge_intro(text: str) -> str:
     if "challenged" in lowered and ":" in text:
         return text.split(":", 1)[1].strip()
     return text
+
+
+def _lookup_batter_height_inches(player_heights: Dict[int, float], batter_id: Any) -> Optional[float]:
+    if batter_id is None:
+        return None
+    try:
+        return player_heights.get(int(batter_id))
+    except (TypeError, ValueError):
+        return None
+
+
+def _height_based_zone_bounds(height_inches: Optional[float]) -> Tuple[Optional[float], Optional[float]]:
+    if height_inches is None or height_inches <= 0:
+        return None, None
+    return (
+        (height_inches * BATTER_ZONE_TOP_PCT) / 12.0,
+        (height_inches * BATTER_ZONE_BOTTOM_PCT) / 12.0,
+    )
+
+
+def _parse_height_to_inches(height_text: Any) -> Optional[float]:
+    if not height_text:
+        return None
+    match = re.search(r"(\d+)\s*'\s*(\d+)", str(height_text))
+    if not match:
+        return None
+    feet = int(match.group(1))
+    inches = int(match.group(2))
+    return float((feet * 12) + inches)
