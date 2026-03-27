@@ -14,6 +14,12 @@ BALL_RADIUS_INCHES = 1.4375
 BALL_RADIUS_FEET = BALL_RADIUS_INCHES / 12.0
 BATTER_ZONE_TOP_PCT = 0.535
 BATTER_ZONE_BOTTOM_PCT = 0.270
+DISPLAY_BALL_RADIUS_INCHES = BALL_RADIUS_INCHES * 0.88
+DISPLAY_HORIZONTAL_RATIO_SCALE = 0.9443896052825135
+DISPLAY_HORIZONTAL_RATIO_OFFSET = 0.0719654365214366
+DISPLAY_VERTICAL_RATIO_SCALE = 1.0238809945341556
+DISPLAY_VERTICAL_RATIO_OFFSET = 0.03892297233657865
+DISPLAY_ZONE_WIDTH_INCHES = 17.0
 
 
 def extract_abs_challenges(feed: Dict[str, Any]) -> List[AbsChallenge]:
@@ -456,6 +462,8 @@ def _build_challenge(
         start_speed=pitch_data.get("startSpeed"),
         px=coordinates.get("pX"),
         pz=coordinates.get("pZ"),
+        display_x=coordinates.get("x"),
+        display_y=coordinates.get("y"),
         strike_zone_top=pitch_data.get("strikeZoneTop"),
         strike_zone_bottom=pitch_data.get("strikeZoneBottom"),
         normalized_zone_top=normalized_zone_top,
@@ -725,10 +733,61 @@ def _pitch_miss_details(
         vertical_description = "high"
 
     if horizontal_miss == 0 and vertical_miss == 0:
-        return None, None
+        return _estimated_display_miss_details(
+            px=px,
+            pz=pz,
+            zone_top=zone_top,
+            zone_bottom=zone_bottom,
+        )
 
     distance_inches = math.hypot(horizontal_miss, vertical_miss) * 12.0
     if horizontal_miss > 0 and vertical_miss > 0:
+        description = "off corner"
+    elif vertical_description:
+        description = vertical_description
+    else:
+        description = "off edge"
+    return distance_inches, description
+
+
+def _estimated_display_miss_details(
+    *,
+    px: float,
+    pz: float,
+    zone_top: float,
+    zone_bottom: float,
+) -> Tuple[Optional[float], Optional[str]]:
+    if zone_top <= zone_bottom:
+        return None, None
+
+    zone_half_width = 17.0 / 24.0
+    raw_horizontal_ratio = (px + zone_half_width) / (zone_half_width * 2.0)
+    raw_vertical_ratio = (zone_top - pz) / (zone_top - zone_bottom)
+
+    display_horizontal_ratio = (raw_horizontal_ratio * DISPLAY_HORIZONTAL_RATIO_SCALE) + DISPLAY_HORIZONTAL_RATIO_OFFSET
+    display_vertical_ratio = (raw_vertical_ratio * DISPLAY_VERTICAL_RATIO_SCALE) + DISPLAY_VERTICAL_RATIO_OFFSET
+    ball_radius_ratio = DISPLAY_BALL_RADIUS_INCHES / DISPLAY_ZONE_WIDTH_INCHES
+
+    horizontal_miss_inches = 0.0
+    if display_horizontal_ratio < -ball_radius_ratio:
+        horizontal_miss_inches = (-ball_radius_ratio - display_horizontal_ratio) * DISPLAY_ZONE_WIDTH_INCHES
+    elif display_horizontal_ratio > 1.0 + ball_radius_ratio:
+        horizontal_miss_inches = (display_horizontal_ratio - (1.0 + ball_radius_ratio)) * DISPLAY_ZONE_WIDTH_INCHES
+
+    vertical_miss_inches = 0.0
+    vertical_description: Optional[str] = None
+    if display_vertical_ratio < -ball_radius_ratio:
+        vertical_miss_inches = (-ball_radius_ratio - display_vertical_ratio) * DISPLAY_ZONE_WIDTH_INCHES
+        vertical_description = "high"
+    elif display_vertical_ratio > 1.0 + ball_radius_ratio:
+        vertical_miss_inches = (display_vertical_ratio - (1.0 + ball_radius_ratio)) * DISPLAY_ZONE_WIDTH_INCHES
+        vertical_description = "low"
+
+    if horizontal_miss_inches == 0 and vertical_miss_inches == 0:
+        return None, None
+
+    distance_inches = math.hypot(horizontal_miss_inches, vertical_miss_inches)
+    if horizontal_miss_inches > 0 and vertical_miss_inches > 0:
         description = "off corner"
     elif vertical_description:
         description = vertical_description

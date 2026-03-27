@@ -45,6 +45,13 @@ ZONE_WIDTH_TARGET_RATIO = 0.74
 ZONE_HEIGHT_TARGET_RATIO = 0.68
 ZONE_CENTER_Y_RATIO = 0.42
 PERSPECTIVE_BAND_HEIGHT = 38
+STATCAST_ZONE_WIDTH_UNITS = 113.0
+STATCAST_ZONE_HEIGHT_UNITS = 127.0
+BALL_STYLIZE_SCALE = 0.88
+HORIZONTAL_RATIO_SCALE = 0.9443896052825135
+HORIZONTAL_RATIO_OFFSET = 0.0719654365214366
+VERTICAL_RATIO_SCALE = 1.0238809945341556
+VERTICAL_RATIO_OFFSET = 0.03892297233657865
 
 
 def render_challenge_card(challenge: AbsChallenge, output_dir: Path) -> Path:
@@ -136,16 +143,14 @@ def _draw_strike_zone_png(
     small_font: "ImageFont.ImageFont",
 ) -> None:  # pragma: no cover - visual output
     sx1, sy1, sx2, sy2, px_per_inch, zone_top_ft, zone_bottom_ft = _zone_layout(challenge)
-    draw.rounded_rectangle((sx1, sy1, sx2, sy2), radius=10, outline=CARD_OUTLINE, width=2)
+    draw.rectangle((sx1, sy1, sx2, sy2), outline=CARD_OUTLINE, width=2)
     _draw_plot_home_plate_png(draw, sx1, sx2)
 
-    if challenge.pitch.px is not None and challenge.pitch.pz is not None:
-        zone_center_x = (sx1 + sx2) / 2.0
-        zone_bottom_y = sy2
-        px = zone_center_x + (challenge.pitch.px * 12.0 * px_per_inch)
-        py = zone_bottom_y - ((challenge.pitch.pz - zone_bottom_ft) * 12.0 * px_per_inch)
+    pitch_center = _pitch_center(challenge, sx1=sx1, sy1=sy1, sx2=sx2, sy2=sy2)
+    if pitch_center is not None:
+        px, py = pitch_center
         fill = "#d62828" if challenge.final_call == "Ball" else "#2a9d8f"
-        ball_radius_px = (BASEBALL_DIAMETER_INCHES * px_per_inch) / 2.0
+        ball_radius_px = ((BASEBALL_DIAMETER_INCHES * px_per_inch) / 2.0) * BALL_STYLIZE_SCALE
         draw.ellipse(
             (px - ball_radius_px, py - ball_radius_px, px + ball_radius_px, py + ball_radius_px),
             fill=fill,
@@ -184,18 +189,16 @@ def _draw_bases_diamond_png(
 
 
 def _build_svg(challenge: AbsChallenge) -> str:
-    sx1, sy1, sx2, sy2, px_per_inch, _, zone_bottom_ft = _zone_layout(challenge)
+    sx1, sy1, sx2, sy2, px_per_inch, _, _ = _zone_layout(challenge)
     home_plate_svg = _build_plot_home_plate_svg(sx1, sx2)
 
     pitch_circle = ""
     pitch_label = ""
-    if challenge.pitch.px is not None and challenge.pitch.pz is not None:
-        zone_center_x = (sx1 + sx2) / 2.0
-        zone_bottom_y = sy2
-        pitch_x = zone_center_x + (challenge.pitch.px * 12.0 * px_per_inch)
-        pitch_y = zone_bottom_y - ((challenge.pitch.pz - zone_bottom_ft) * 12.0 * px_per_inch)
+    pitch_center = _pitch_center(challenge, sx1=sx1, sy1=sy1, sx2=sx2, sy2=sy2)
+    if pitch_center is not None:
+        pitch_x, pitch_y = pitch_center
         pitch_fill = "#d62828" if challenge.final_call == "Ball" else "#2a9d8f"
-        ball_radius_px = (BASEBALL_DIAMETER_INCHES * px_per_inch) / 2.0
+        ball_radius_px = ((BASEBALL_DIAMETER_INCHES * px_per_inch) / 2.0) * BALL_STYLIZE_SCALE
         label_anchor = "start"
         label_x = pitch_x + ball_radius_px + 10
         if pitch_x > (PLOT_LEFT + (PLOT_WIDTH * 0.62)):
@@ -260,7 +263,7 @@ def _build_svg(challenge: AbsChallenge) -> str:
   <text x="86" y="618" font-size="22" fill="{outcome_fill if challenge.changed_call else '#9ad1d4'}">ABS: {escape(challenge.final_call)}</text>
   {miss_svg}
   <text x="86" y="{pitch_svg_y}" font-size="22" fill="#ffffff">{escape(challenge.pitch.pitch_type)} | {escape(speed)}</text>
-  <rect x="{sx1:.1f}" y="{sy1:.1f}" width="{sx2 - sx1:.1f}" height="{sy2 - sy1:.1f}" rx="10" fill="none" stroke="{CARD_OUTLINE}" stroke-width="2" />
+  <rect x="{sx1:.1f}" y="{sy1:.1f}" width="{sx2 - sx1:.1f}" height="{sy2 - sy1:.1f}" fill="none" stroke="{CARD_OUTLINE}" stroke-width="2" />
   {home_plate_svg}
   {pitch_circle}
   {pitch_label}
@@ -280,16 +283,13 @@ def _strike_zone_geometry(challenge: AbsChallenge) -> tuple[float, float, float]
 
 
 def _zone_layout(challenge: AbsChallenge) -> tuple[float, float, float, float, float, float, float]:
-    zone_half_width, zone_top_ft, zone_bottom_ft = _strike_zone_geometry(challenge)
-    zone_width_inches = PLATE_WIDTH_INCHES
-    zone_height_inches = (zone_top_ft - zone_bottom_ft) * 12.0
-    px_per_inch = min(
-        (PLOT_WIDTH * ZONE_WIDTH_TARGET_RATIO) / zone_width_inches,
-        (PLOT_HEIGHT * ZONE_HEIGHT_TARGET_RATIO) / zone_height_inches,
+    _, zone_top_ft, zone_bottom_ft = _strike_zone_geometry(challenge)
+    zone_width_px = PLOT_WIDTH * ZONE_WIDTH_TARGET_RATIO
+    zone_height_px = min(
+        PLOT_HEIGHT * ZONE_HEIGHT_TARGET_RATIO,
+        zone_width_px * (STATCAST_ZONE_HEIGHT_UNITS / STATCAST_ZONE_WIDTH_UNITS),
     )
-
-    zone_width_px = zone_width_inches * px_per_inch
-    zone_height_px = zone_height_inches * px_per_inch
+    px_per_inch = zone_width_px / PLATE_WIDTH_INCHES
     zone_center_x = PLOT_LEFT + (PLOT_WIDTH / 2.0)
     zone_center_y = PLOT_TOP + (PLOT_HEIGHT * ZONE_CENTER_Y_RATIO)
     sx1 = zone_center_x - (zone_width_px / 2.0)
@@ -297,6 +297,34 @@ def _zone_layout(challenge: AbsChallenge) -> tuple[float, float, float, float, f
     sx2 = zone_center_x + (zone_width_px / 2.0)
     sy2 = zone_center_y + (zone_height_px / 2.0)
     return sx1, sy1, sx2, sy2, px_per_inch, zone_top_ft, zone_bottom_ft
+
+
+def _pitch_center(
+    challenge: AbsChallenge,
+    *,
+    sx1: float,
+    sy1: float,
+    sx2: float,
+    sy2: float,
+) -> tuple[float, float] | None:
+    if challenge.pitch.px is None or challenge.pitch.pz is None:
+        return None
+
+    zone_top_ft = challenge.pitch.strike_zone_top or challenge.pitch.display_zone_top
+    zone_bottom_ft = challenge.pitch.strike_zone_bottom or challenge.pitch.display_zone_bottom
+    if zone_top_ft is None or zone_bottom_ft is None or zone_top_ft <= zone_bottom_ft:
+        return None
+
+    zone_half_width_ft = PLATE_WIDTH_INCHES / 24.0
+    raw_horizontal_ratio = (challenge.pitch.px + zone_half_width_ft) / (zone_half_width_ft * 2.0)
+    raw_vertical_ratio = (zone_top_ft - challenge.pitch.pz) / (zone_top_ft - zone_bottom_ft)
+
+    display_horizontal_ratio = (raw_horizontal_ratio * HORIZONTAL_RATIO_SCALE) + HORIZONTAL_RATIO_OFFSET
+    display_vertical_ratio = (raw_vertical_ratio * VERTICAL_RATIO_SCALE) + VERTICAL_RATIO_OFFSET
+
+    pitch_x = sx1 + ((sx2 - sx1) * display_horizontal_ratio)
+    pitch_y = sy1 + ((sy2 - sy1) * display_vertical_ratio)
+    return pitch_x, pitch_y
 
 
 def _draw_plot_home_plate_png(

@@ -46,6 +46,8 @@ class ChallengePitch:
     start_speed: Optional[float]
     px: Optional[float]
     pz: Optional[float]
+    display_x: Optional[float]
+    display_y: Optional[float]
     strike_zone_top: Optional[float]
     strike_zone_bottom: Optional[float]
     normalized_zone_top: Optional[float]
