@@ -25,6 +25,7 @@ FOOTER_TOP_Y = 658
 FOOTER_MAX_CHARS = 54
 FOOTER_MAX_LINES = 4
 FOOTER_LINE_HEIGHT = 24
+PLOT_BG = "#f0ead6"
 
 
 def render_challenge_card(challenge: AbsChallenge, output_dir: Path) -> Path:
@@ -48,13 +49,13 @@ def _render_png(challenge: AbsChallenge, output_path: Path) -> None:  # pragma: 
     image = Image.new("RGB", (CARD_WIDTH, CARD_HEIGHT), "#f5f1e8")
     draw = ImageDraw.Draw(image)
 
-    title_font = ImageFont.load_default()
-    body_font = ImageFont.load_default()
-    small_font = ImageFont.load_default()
+    title_font = _load_font(28, bold=True)
+    body_font = _load_font(22)
+    small_font = _load_font(18)
 
     draw.rounded_rectangle((32, 32, CARD_WIDTH - 32, CARD_HEIGHT - 32), radius=28, fill=CARD_BG, outline=CARD_OUTLINE, width=4)
     draw.rounded_rectangle((58, 58, 500, 742), radius=20, fill=CARD_OUTLINE)
-    draw.rounded_rectangle((535, 58, 1142, 742), radius=20, fill="#f0ead6")
+    draw.rounded_rectangle((535, 58, 1142, 742), radius=20, fill=PLOT_BG)
 
     draw.text((86, 90), "ABS Challenge", fill="#fefefe", font=title_font)
     draw.text((86, 125), challenge.outcome_label.upper(), fill=CARD_ACCENT if challenge.is_overturned else "#9ad1d4", font=title_font)
@@ -140,7 +141,7 @@ def _draw_strike_zone_png(
 
     sx1, sy1 = to_px(-zone_half_width, zone_top_ft)
     sx2, sy2 = to_px(zone_half_width, zone_bottom_ft)
-    draw.rounded_rectangle((sx1, sy1, sx2, sy2), radius=10, outline=CARD_OUTLINE, width=2, fill="#fffef8")
+    draw.rounded_rectangle((sx1, sy1, sx2, sy2), radius=10, outline=CARD_OUTLINE, width=2)
 
     if challenge.pitch.px is not None and challenge.pitch.pz is not None:
         px, py = to_px(challenge.pitch.px, challenge.pitch.pz)
@@ -232,7 +233,7 @@ def _build_svg(challenge: AbsChallenge) -> str:
   <rect width="{CARD_WIDTH}" height="{CARD_HEIGHT}" fill="#f5f1e8" />
   <rect x="32" y="32" width="1136" height="736" rx="28" fill="{CARD_BG}" stroke="{CARD_OUTLINE}" stroke-width="4" />
   <rect x="58" y="58" width="442" height="684" rx="20" fill="{CARD_OUTLINE}" />
-  <rect x="535" y="58" width="607" height="684" rx="20" fill="#f0ead6" />
+  <rect x="535" y="58" width="607" height="684" rx="20" fill="{PLOT_BG}" />
   <text x="86" y="100" font-size="28" font-weight="700" fill="#ffffff">ABS Challenge</text>
   <text x="86" y="138" font-size="28" font-weight="700" fill="{outcome_fill}">{escape(challenge.outcome_label.upper())}</text>
   <text x="86" y="190" font-size="26" fill="#ffffff">{escape(challenge.teams.matchup_label)}</text>
@@ -249,8 +250,8 @@ def _build_svg(challenge: AbsChallenge) -> str:
   <text x="86" y="618" font-size="22" fill="{outcome_fill if challenge.changed_call else '#9ad1d4'}">ABS: {escape(challenge.final_call)}</text>
   {miss_svg}
   <text x="86" y="{pitch_svg_y}" font-size="22" fill="#ffffff">{escape(challenge.pitch.pitch_type)} | {escape(speed)}</text>
-  <rect x="{plot_left}" y="{plot_top}" width="{plot_width}" height="{plot_height}" fill="#fffef8" stroke="{CARD_OUTLINE}" stroke-width="2" />
-  <rect x="{sx1:.1f}" y="{sy1:.1f}" width="{sx2 - sx1:.1f}" height="{sy2 - sy1:.1f}" rx="10" fill="{CARD_BG}" stroke="{CARD_OUTLINE}" stroke-width="2" />
+  <rect x="{plot_left}" y="{plot_top}" width="{plot_width}" height="{plot_height}" fill="none" stroke="{CARD_OUTLINE}" stroke-width="2" />
+  <rect x="{sx1:.1f}" y="{sy1:.1f}" width="{sx2 - sx1:.1f}" height="{sy2 - sy1:.1f}" rx="10" fill="none" stroke="{CARD_OUTLINE}" stroke-width="2" />
   {pitch_circle}
   {pitch_label}
   <text x="{FOOTER_CENTER_X}" y="{FOOTER_TOP_Y}" font-size="18" fill="{CARD_OUTLINE}" text-anchor="middle">{footer_tspans}</text>
@@ -275,6 +276,38 @@ def _draw_centered_footer_png(
         width = bbox[2] - bbox[0]
         draw.text((center_x - (width / 2), y), line, fill=CARD_OUTLINE, font=font)
         y += FOOTER_LINE_HEIGHT
+
+
+def _load_font(size: int, *, bold: bool = False) -> "ImageFont.ImageFont":
+    candidates = []
+    if bold:
+        candidates.extend(
+            [
+                "C:/Windows/Fonts/georgiab.ttf",
+                "C:/Windows/Fonts/timesbd.ttf",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf",
+                "/usr/share/fonts/truetype/liberation2/LiberationSerif-Bold.ttf",
+            ]
+        )
+    else:
+        candidates.extend(
+            [
+                "C:/Windows/Fonts/georgia.ttf",
+                "C:/Windows/Fonts/times.ttf",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
+                "/usr/share/fonts/truetype/liberation2/LiberationSerif-Regular.ttf",
+            ]
+        )
+
+    for candidate in candidates:
+        path = Path(candidate)
+        if not path.exists():
+            continue
+        try:
+            return ImageFont.truetype(str(path), size=size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
 
 
 def _wrap_text(text: str, *, max_chars: int, max_lines: int) -> list[str]:
