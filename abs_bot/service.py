@@ -6,7 +6,7 @@ from collections import deque
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Deque, Dict, List
+from typing import Any, Deque, Dict, List, Set
 
 from .challenges import extract_abs_challenges, format_post_text
 from .mlb import MlbStatsApiClient
@@ -14,7 +14,7 @@ from .publishers import Publisher
 from .render import render_challenge_card
 
 
-STATE_VERSION = 6
+STATE_VERSION = 7
 
 
 class AbsBotService:
@@ -57,7 +57,8 @@ class AbsBotService:
         self.next_game_at: str | None = None
         self.total_posts = 0
         self.recent_posts: Deque[Dict[str, Any]] = deque(maxlen=20)
-        self.seen_challenge_ids, self.umpire_stats = self._load_state()
+        self.recent_failures: Deque[Dict[str, Any]] = deque(maxlen=20)
+        self.seen_challenge_ids, self.umpire_stats, self.publisher_delivery = self._load_state()
         self.closed_game_pks: set[int] = set()
 
     def run_forever(self) -> None:
@@ -123,27 +124,50 @@ class AbsBotService:
             if not game_pk:
                 continue
             feed = self.client.fetch_live_game_feed(game_pk)
+            game_has_pending_delivery = False
             for challenge in extract_abs_challenges(feed):
                 if challenge.challenge_id in self.seen_challenge_ids:
                     continue
                 challenge = self._challenge_with_umpire_stats(challenge)
                 artifact_path = render_challenge_card(challenge, self.output_dir)
                 post_text = format_post_text(challenge)
+                delivered_publishers = self.publisher_delivery.get(challenge.challenge_id, set())
+                publisher_failures: list[str] = []
                 for publisher in self.publishers:
-                    publisher.publish(challenge, post_text, artifact_path)
+                    if publisher.delivery_key in delivered_publishers:
+                        continue
+                    try:
+                        publisher.publish(challenge, post_text, artifact_path)
+                    except Exception as exc:
+                        publisher_failures.append(f"{publisher.delivery_key}: {exc}")
+                        continue
+                    self._mark_publisher_delivered(challenge.challenge_id, publisher.delivery_key)
+                    delivered_publishers = self.publisher_delivery.get(challenge.challenge_id, set())
+
+                if publisher_failures:
+                    self._record_failures(challenge, publisher_failures)
+
                 artifact_retained = self.keep_artifacts or not self.publishers
-                self._record_challenge(
-                    challenge.challenge_id,
-                    challenge,
-                    artifact_path if artifact_retained else None,
-                    post_text,
-                    artifact_retained=artifact_retained,
+                completed_this_cycle = self._publishers_complete(challenge.challenge_id)
+                if completed_this_cycle:
+                    self._record_challenge(
+                        challenge.challenge_id,
+                        challenge,
+                        artifact_path if artifact_retained else None,
+                        post_text,
+                        artifact_retained=artifact_retained,
                 )
                 if not artifact_retained:
                     artifact_path.unlink(missing_ok=True)
-                new_posts += 1
+                if completed_this_cycle:
+                    new_posts += 1
+                else:
+                    game_has_pending_delivery = True
             if self.client.is_terminal_game(game):
-                self.closed_game_pks.add(game_pk)
+                if game_has_pending_delivery:
+                    self.closed_game_pks.discard(game_pk)
+                else:
+                    self.closed_game_pks.add(game_pk)
 
         sleep_seconds, mode, wake_reason, next_game_at = self._next_sleep_plan(
             now=now,
@@ -185,8 +209,10 @@ class AbsBotService:
                 "next_game_at": self.next_game_at,
                 "seen_challenges": len(self.seen_challenge_ids),
                 "tracked_umpires": len(self.umpire_stats),
+                "pending_publisher_deliveries": len(self.publisher_delivery),
                 "total_posts": self.total_posts,
                 "recent_posts": list(self.recent_posts),
+                "recent_failures": list(self.recent_failures),
             }
 
     def _record_challenge(
@@ -200,6 +226,7 @@ class AbsBotService:
     ) -> None:
         with self.state_lock:
             self.seen_challenge_ids.add(challenge_id)
+            self.publisher_delivery.pop(challenge_id, None)
             self._update_umpire_stats(challenge)
             self.recent_posts.appendleft(
                 {
@@ -217,17 +244,44 @@ class AbsBotService:
             )
             self._save_state()
 
-    def _load_state(self) -> tuple[set[str], dict[str, Dict[str, Any]]]:
+    def _mark_publisher_delivered(self, challenge_id: str, publisher_key: str) -> None:
+        with self.state_lock:
+            delivery = self.publisher_delivery.setdefault(challenge_id, set())
+            delivery.add(publisher_key)
+            self._save_state()
+
+    def _record_failures(self, challenge: Any, failures: list[str]) -> None:
+        with self.state_lock:
+            message = "; ".join(failures)
+            self.last_error = message
+            self.recent_failures.appendleft(
+                {
+                    "challenge_id": challenge.challenge_id,
+                    "matchup": challenge.teams.matchup_label,
+                    "inning": challenge.inning_label,
+                    "challenger": challenge.challenger_name,
+                    "failures": failures,
+                    "failed_at": _utc_now_iso(),
+                }
+            )
+
+    def _publishers_complete(self, challenge_id: str) -> bool:
+        if not self.publishers:
+            return True
+        delivered = self.publisher_delivery.get(challenge_id, set())
+        return all(publisher.delivery_key in delivered for publisher in self.publishers)
+
+    def _load_state(self) -> tuple[set[str], dict[str, Dict[str, Any]], dict[str, Set[str]]]:
         if not self.state_file.exists():
-            return set(), {}
+            return set(), {}, {}
         try:
             payload = json.loads(self.state_file.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
-            return set(), {}
+            return set(), {}, {}
         if isinstance(payload, list):
-            return {str(item) for item in payload}, {}
+            return {str(item) for item in payload}, {}, {}
         if not isinstance(payload, dict):
-            return set(), {}
+            return set(), {}, {}
 
         payload_version = int(payload.get("state_version", 0) or 0)
         seen_ids: set[str] = set()
@@ -246,7 +300,17 @@ class AbsBotService:
                     "confirmed": int(value.get("confirmed", 0) or 0),
                     "overturned": int(value.get("overturned", 0) or 0),
                 }
-        return seen_ids, umpire_stats
+        publisher_delivery: dict[str, Set[str]] = {}
+        delivery_payload = payload.get("publisher_delivery", {})
+        if payload_version == STATE_VERSION and isinstance(delivery_payload, dict):
+            for key, value in delivery_payload.items():
+                if isinstance(value, list):
+                    publisher_delivery[str(key)] = {
+                        str(item)
+                        for item in value
+                        if item is not None
+                    }
+        return seen_ids, umpire_stats, publisher_delivery
 
     def _save_state(self) -> None:
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
@@ -256,6 +320,10 @@ class AbsBotService:
                     "state_version": STATE_VERSION,
                     "seen_challenge_ids": sorted(self.seen_challenge_ids),
                     "umpire_stats": self.umpire_stats,
+                    "publisher_delivery": {
+                        key: sorted(value)
+                        for key, value in self.publisher_delivery.items()
+                    },
                 },
                 indent=2,
             ),

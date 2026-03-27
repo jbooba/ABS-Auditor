@@ -8,11 +8,15 @@ from pathlib import Path
 from typing import List
 from urllib.request import Request, urlopen
 
-from .challenges import format_alt_text, format_bluesky_post_text
+from .challenges import format_alt_text, format_bluesky_post_text, format_x_post_text
 from .models import AbsChallenge
 
 
 class Publisher:
+    @property
+    def delivery_key(self) -> str:
+        raise NotImplementedError
+
     def publish(self, challenge: AbsChallenge, text: str, image_path: Path) -> None:
         raise NotImplementedError
 
@@ -20,6 +24,10 @@ class Publisher:
 class DiscordWebhookPublisher(Publisher):
     def __init__(self, webhook_url: str) -> None:
         self.webhook_url = webhook_url
+
+    @property
+    def delivery_key(self) -> str:
+        return "discord"
 
     def publish(self, challenge: AbsChallenge, text: str, image_path: Path) -> None:
         payload_json = json.dumps({"content": text})
@@ -42,6 +50,10 @@ class BlueSkyPublisher(Publisher):
     def __init__(self, handle: str, app_password: str) -> None:
         self.handle = handle
         self.app_password = app_password
+
+    @property
+    def delivery_key(self) -> str:
+        return f"bluesky:{self.handle.lower()}"
 
     def publish(self, challenge: AbsChallenge, text: str, image_path: Path) -> None:  # pragma: no cover - network integration
         try:
@@ -79,6 +91,10 @@ class XPublisher(Publisher):
         self.access_token = access_token
         self.access_token_secret = access_token_secret
 
+    @property
+    def delivery_key(self) -> str:
+        return "x"
+
     def publish(self, challenge: AbsChallenge, text: str, image_path: Path) -> None:  # pragma: no cover - network integration
         try:
             import tweepy
@@ -99,7 +115,7 @@ class XPublisher(Publisher):
             access_token=self.access_token,
             access_token_secret=self.access_token_secret,
         )
-        client.create_tweet(text=text, media_ids=[media.media_id_string])
+        client.create_tweet(text=format_x_post_text(challenge), media_ids=[media.media_id_string])
 
 
 def publishers_from_env() -> List[Publisher]:

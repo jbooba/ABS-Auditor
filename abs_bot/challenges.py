@@ -137,6 +137,14 @@ def format_post_text(challenge: AbsChallenge) -> str:
 
 
 def format_bluesky_post_text(challenge: AbsChallenge) -> str:
+    return _format_compact_social_post(challenge, limit=300)
+
+
+def format_x_post_text(challenge: AbsChallenge) -> str:
+    return _format_compact_social_post(challenge, limit=280)
+
+
+def _format_compact_social_post(challenge: AbsChallenge, *, limit: int) -> str:
     matchup_text = _matchup_with_tags(challenge.teams)
     if challenge.challenger_name == challenge.batter_name:
         challenge_line = (
@@ -172,7 +180,7 @@ def format_bluesky_post_text(challenge: AbsChallenge) -> str:
     if result_line:
         lines.append(result_line)
 
-    return _fit_bluesky_text(lines)
+    return _fit_bluesky_text(lines, limit=limit)
 
 
 def format_alt_text(challenge: AbsChallenge) -> str:
