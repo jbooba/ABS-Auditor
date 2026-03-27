@@ -12,9 +12,6 @@ ABS_REVIEW_TYPE = "MJ"
 BASE_ORDER = ("1B", "2B", "3B")
 BALL_RADIUS_INCHES = 1.4375
 BALL_RADIUS_FEET = BALL_RADIUS_INCHES / 12.0
-TEAM_TAG_MAX_WORDS = 4
-
-
 def extract_abs_challenges(feed: Dict[str, Any]) -> List[AbsChallenge]:
     teams = _extract_teams(feed)
     home_plate_umpire_id, home_plate_umpire_name = _extract_home_plate_umpire(feed)
@@ -270,14 +267,20 @@ def _matchup_with_tags(teams: GameTeams) -> str:
 
 
 def _team_hashtag(team_name: str) -> str:
-    cleaned = re.sub(r"[^A-Za-z0-9 ]+", "", team_name).strip()
-    if not cleaned:
-        return team_name
-    words = cleaned.split()
+    words = re.findall(r"[A-Za-z0-9]+", team_name)
     if not words:
         return team_name
-    hashtag_words = words[:TEAM_TAG_MAX_WORDS]
-    return "#" + "".join(word.capitalize() for word in hashtag_words)
+
+    trailing_pair = tuple(word.lower() for word in words[-2:])
+    pair_map = {
+        ("red", "sox"): "RedSox",
+        ("white", "sox"): "WhiteSox",
+        ("blue", "jays"): "BlueJays",
+    }
+    if trailing_pair in pair_map:
+        return f"#{pair_map[trailing_pair]}"
+
+    return f"#{words[-1].capitalize()}"
 
 
 def safe_text(value: Any) -> str:
