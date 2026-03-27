@@ -380,7 +380,13 @@ def _build_challenge(
     about = play.get("about", {})
     matchup = play.get("matchup", {})
     challenge_team_id = review.get("challengeTeamId")
-    original_call, final_call = _resolve_calls(review, pitch_event)
+    batting_team_id = teams.away_id if about.get("isTopInning") else teams.home_id
+    original_call, final_call = _resolve_calls(
+        review,
+        pitch_event,
+        challenge_team_id=challenge_team_id,
+        batting_team_id=batting_team_id,
+    )
 
     pitch_details = pitch_event.get("details", {}) if pitch_event else {}
     pitch_data = pitch_event.get("pitchData", {}) if pitch_event else {}
@@ -574,7 +580,18 @@ def _extract_post_bases(play: Dict[str, Any]) -> dict[str, dict[str, Any]]:
 def _resolve_calls(
     review: Dict[str, Any],
     pitch_event: Optional[Dict[str, Any]],
+    *,
+    challenge_team_id: Optional[int],
+    batting_team_id: Optional[int],
 ) -> Tuple[str, str]:
+    inferred = _resolve_calls_from_challenger(
+        review,
+        challenge_team_id=challenge_team_id,
+        batting_team_id=batting_team_id,
+    )
+    if inferred is not None:
+        return inferred
+
     original_call = _normalize_review_call(pitch_event)
     if not review.get("isOverturned"):
         return original_call, original_call
@@ -583,6 +600,25 @@ def _resolve_calls(
     if original_call == "Called Strike":
         return "Called Strike", "Ball"
     return original_call, "Unknown"
+
+
+def _resolve_calls_from_challenger(
+    review: Dict[str, Any],
+    *,
+    challenge_team_id: Optional[int],
+    batting_team_id: Optional[int],
+) -> Optional[Tuple[str, str]]:
+    if challenge_team_id is None or batting_team_id is None:
+        return None
+
+    challenger_is_offense = challenge_team_id == batting_team_id
+    original_call = "Called Strike" if challenger_is_offense else "Ball"
+    if not review.get("isOverturned"):
+        return original_call, original_call
+    return (
+        original_call,
+        "Ball" if challenger_is_offense else "Called Strike",
+    )
 
 
 def _normalize_review_call(pitch_event: Optional[Dict[str, Any]]) -> str:
