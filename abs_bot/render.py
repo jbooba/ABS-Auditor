@@ -41,9 +41,9 @@ PLATE_WIDTH_INCHES = 17.0
 BASEBALL_DIAMETER_INCHES = 2.89
 BALL_RADIUS_INCHES = BASEBALL_DIAMETER_INCHES / 2.0
 BALL_RADIUS_FEET = BALL_RADIUS_INCHES / 12.0
-ZONE_WIDTH_TARGET_RATIO = 0.74
+ZONE_WIDTH_TARGET_RATIO = 0.70
 ZONE_HEIGHT_TARGET_RATIO = 0.68
-ZONE_CENTER_Y_RATIO = 0.42
+ZONE_CENTER_Y_RATIO = 0.50
 PERSPECTIVE_BAND_HEIGHT = 38
 STATCAST_ZONE_WIDTH_UNITS = 113.0
 STATCAST_ZONE_HEIGHT_UNITS = 127.0
@@ -333,7 +333,7 @@ def _draw_plot_home_plate_png(
     zone_right: float,
 ) -> None:  # pragma: no cover - visual output
     band, plate = _plot_home_plate_geometry(zone_left, zone_right)
-    draw.rounded_rectangle(band, radius=6, fill="#dad9d7")
+    draw.rectangle(band, fill="#dad9d7")
     draw.polygon(plate, fill="#faf7f0", outline=CARD_OUTLINE)
 
 
@@ -343,7 +343,7 @@ def _build_plot_home_plate_svg(zone_left: float, zone_right: float) -> str:
     plate_points = " ".join(f"{x:.1f},{y:.1f}" for x, y in plate)
     return (
         f'<rect x="{band_left:.1f}" y="{band_top:.1f}" width="{band_right - band_left:.1f}" '
-        f'height="{band_bottom - band_top:.1f}" rx="6" fill="#dad9d7" />'
+        f'height="{band_bottom - band_top:.1f}" fill="#dad9d7" />'
         f'<polygon points="{plate_points}" fill="#faf7f0" stroke="{CARD_OUTLINE}" stroke-width="1.5" />'
     )
 
@@ -365,11 +365,14 @@ def _plot_home_plate_geometry(
         band_bottom,
     )
 
-    plate_top_width = zone_width
-    plate_shoulder_width = plate_top_width * 0.95
+    # Match pybaseball's plate proportions more closely: a narrower top edge
+    # with shoulders that flare to the full zone width.
+    plate_shoulder_width = zone_width
+    plate_top_width = plate_shoulder_width * (1.42 / 1.70)
+    plate_height = PERSPECTIVE_BAND_HEIGHT * 0.82
     plate_top_y = band_top + 3
-    plate_shoulder_y = band_top + (PERSPECTIVE_BAND_HEIGHT * 0.46)
-    plate_bottom_y = band_bottom - 2
+    plate_shoulder_y = plate_top_y + (plate_height * 0.34)
+    plate_bottom_y = plate_top_y + plate_height
     plate = (
         (center_x - (plate_top_width / 2.0), plate_top_y),
         (center_x + (plate_top_width / 2.0), plate_top_y),
