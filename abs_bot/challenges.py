@@ -151,11 +151,23 @@ def format_x_post_text(challenge: AbsChallenge) -> str:
 
 
 def format_bluesky_clip_post_text(challenge: AbsChallenge, clip_url: str) -> str:
-    return _format_link_social_post(challenge, clip_url=clip_url, limit=300)
+    return _format_link_social_post(
+        challenge,
+        clip_url=clip_url,
+        limit=300,
+        link_char_count=len(clip_url),
+        clip_mode=True,
+    )
 
 
 def format_x_clip_post_text(challenge: AbsChallenge, clip_url: str) -> str:
-    return _format_link_social_post(challenge, clip_url=clip_url, limit=280)
+    return _format_link_social_post(
+        challenge,
+        clip_url=clip_url,
+        limit=280,
+        link_char_count=24,
+        clip_mode=True,
+    )
 
 
 def _format_compact_social_post(challenge: AbsChallenge, *, limit: int) -> str:
@@ -197,13 +209,43 @@ def _format_compact_social_post(challenge: AbsChallenge, *, limit: int) -> str:
     return _fit_bluesky_text(lines, limit=limit)
 
 
-def _format_link_social_post(challenge: AbsChallenge, *, clip_url: str, limit: int) -> str:
-    reserved = min(40, len(clip_url) + 1)
-    body = _format_compact_social_post(challenge, limit=max(120, limit - reserved))
+def _format_link_social_post(
+    challenge: AbsChallenge,
+    *,
+    clip_url: str,
+    limit: int,
+    link_char_count: int,
+    clip_mode: bool = False,
+) -> str:
+    reserved = max(1, link_char_count + 1)
+    body_limit = max(80, limit - reserved)
+    body = (
+        _format_clip_social_post(challenge, limit=body_limit)
+        if clip_mode
+        else _format_compact_social_post(challenge, limit=body_limit)
+    )
     text = f"{body}\n{clip_url}"
     if len(text) <= limit:
         return text
-    return f"{_truncate_line(body, max(32, limit - reserved))}\n{clip_url}"
+    return f"{_truncate_line(body, max(24, limit - reserved))}\n{clip_url}"
+
+
+def _format_clip_social_post(challenge: AbsChallenge, *, limit: int) -> str:
+    lines = [
+        f"ABS {challenge.outcome_label.lower()} in {_matchup_with_tags(challenge.teams)} ({challenge.inning_label}).",
+        _clip_challenge_line(challenge),
+        (
+            f"{_clip_call_transition_text(challenge)} "
+            f"Count {challenge.pitch.count_display}, {challenge.outs_display}, {challenge.runners_display}."
+        ),
+        f"Score: {challenge.score_display}.",
+    ]
+
+    result_line = _bluesky_result_line(challenge)
+    if result_line:
+        lines.append(result_line)
+
+    return _fit_clip_text(lines, limit=limit)
 
 
 def format_alt_text(challenge: AbsChallenge) -> str:
@@ -249,6 +291,22 @@ def _bluesky_result_line(challenge: AbsChallenge) -> str:
     return f"Result: {text}"
 
 
+def _clip_challenge_line(challenge: AbsChallenge) -> str:
+    if challenge.challenger_name == challenge.batter_name:
+        return f"{challenge.challenger_name} challenged."
+    return f"{challenge.challenger_name} challenged {challenge.batter_name}'s pitch."
+
+
+def _clip_call_transition_text(challenge: AbsChallenge) -> str:
+    if challenge.changed_call:
+        return f"{challenge.original_call} -> {challenge.final_call}."
+    if challenge.final_call == "Ball":
+        return "Ball confirmed."
+    if challenge.final_call == "Called Strike":
+        return "Called strike confirmed."
+    return f"{challenge.final_call} confirmed."
+
+
 def _fit_bluesky_text(lines: list[str], limit: int = 300) -> str:
     active_lines = [line for line in lines if line]
     text = "\n".join(active_lines)
@@ -279,6 +337,44 @@ def _fit_bluesky_text(lines: list[str], limit: int = 300) -> str:
         text = "\n".join(active_lines)
         if len(text) <= limit:
             return text
+
+    return _truncate_line(text, limit)
+
+
+def _fit_clip_text(lines: list[str], limit: int) -> str:
+    active_lines = [line for line in lines if line]
+    text = "\n".join(active_lines)
+    if len(text) <= limit:
+        return text
+
+    if active_lines and (active_lines[-1].startswith("Result: ") or active_lines[-1].startswith("Later: ")):
+        available = max(28, limit - _joined_length(active_lines[:-1]) - 1)
+        active_lines[-1] = _truncate_line(active_lines[-1], available)
+        text = "\n".join(active_lines)
+        if len(text) <= limit:
+            return text
+
+    if len(active_lines) >= 4 and active_lines[3].startswith("Score: "):
+        active_lines.pop(3)
+        text = "\n".join(active_lines)
+        if len(text) <= limit:
+            return text
+
+    if len(active_lines) >= 2 and "'s pitch." in active_lines[1]:
+        challenger = active_lines[1].split(" challenged ", 1)[0]
+        active_lines[1] = f"{challenger} challenged."
+        text = "\n".join(active_lines)
+        if len(text) <= limit:
+            return text
+
+    if len(active_lines) >= 3 and ". Count " in active_lines[2]:
+        transition_text, count_text = active_lines[2].split(". Count ", 1)
+        count_bits = count_text.rstrip(".").split(", ")
+        if len(count_bits) >= 2:
+            active_lines[2] = f"{transition_text}. Count {count_bits[0]}, {count_bits[1]}."
+            text = "\n".join(active_lines)
+            if len(text) <= limit:
+                return text
 
     return _truncate_line(text, limit)
 
