@@ -65,8 +65,9 @@ Suggested Railway setup:
 - `ABS_OUTPUT_DIR`: image output directory, default `./output`
 - `ABS_STATE_FILE`: seen challenge + umpire stats state JSON, default `./state/seen_challenges.json`
 - `ABS_KEEP_ARTIFACTS`: keep generated card files after posting, default `0`
-- `ABS_CLIP_WAIT_SECONDS`: how long to keep retrying official MLB clip lookup before falling back to the rendered graphic, default `300`
-- `ABS_RAW_CLIP_WAIT_SECONDS`: when only `mlb-cuts` is available, how long to keep waiting for a preferred raw `bdata` clip before posting the highlight instead, default `120`
+- `ABS_CLIP_WAIT_SECONDS`: how long to keep retrying official MLB clip lookup during live/in-progress game flow before falling back to the rendered graphic, default `900`
+- `ABS_RAW_CLIP_WAIT_SECONDS`: when only `mlb-cuts` is available, how long to keep waiting for a preferred raw `bdata` clip before posting the highlight instead, default `180`
+- `ABS_FINAL_CLIP_WAIT_SECONDS`: how long to keep retrying official MLB clip lookup after the game has reached a terminal state before falling back to the rendered graphic, default `2700`
 - `ABS_DISCORD_WEBHOOK_URL`: Discord webhook target
 - `ABS_BLUESKY_HANDLE`: BlueSky handle
 - `ABS_BLUESKY_APP_PASSWORD`: BlueSky app password
@@ -81,7 +82,7 @@ Suggested Railway setup:
 - The scheduler runs in UTC and watches yesterday/today/tomorrow for active games, while looking further ahead to decide when to wake for the next slate.
 - The bot prefers pitch-level `reviewDetails` when present. If MLB omits that, it falls back to the final pitch in the reviewed at-bat and records that selection reason in the output metadata.
 - Official MLB challenge clips are discovered from the game content feed, with `PlayId`-based Fastball search used as an identity hint to keep same-game challenge matches separated.
-- Clip preference is tiered: the bot posts `bdata-producedclips` immediately, waits briefly for `bdata` when only `mlb-cuts` is available, then falls back to `mlb-cuts`, and finally to a rendered graphic if no usable clip appears in time.
+- Clip preference is tiered: the bot posts `bdata-producedclips` immediately, waits briefly for `bdata` when only `mlb-cuts` is available, keeps checking longer for any official clip while the game is live, extends that wait window after the game ends, then finally falls back to a rendered graphic if no usable clip appears in time.
 - The displayed umpire rate is a challenge-specific upheld rate, not an all-pitches accuracy estimate.
 - The renderer writes PNG when Pillow is installed. If Pillow is unavailable, it falls back to SVG.
 - By default, service-mode artifacts are deleted after successful posting. Sample/manual runs still keep their rendered outputs.

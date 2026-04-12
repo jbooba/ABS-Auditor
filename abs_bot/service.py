@@ -32,8 +32,9 @@ class AbsBotService:
         lookahead_days: int = 7,
         offseason_sleep_seconds: int = 21600,
         keep_artifacts: bool = False,
-        clip_wait_seconds: int = 300,
-        raw_clip_wait_seconds: int = 120,
+        clip_wait_seconds: int = 900,
+        raw_clip_wait_seconds: int = 180,
+        final_clip_wait_seconds: int = 2700,
     ) -> None:
         self.client = client
         self.publishers = publishers
@@ -47,6 +48,7 @@ class AbsBotService:
         self.keep_artifacts = keep_artifacts
         self.clip_wait_seconds = clip_wait_seconds
         self.raw_clip_wait_seconds = raw_clip_wait_seconds
+        self.final_clip_wait_seconds = final_clip_wait_seconds
         self.stop_event = threading.Event()
         self.state_lock = threading.Lock()
         self.last_error: str | None = None
@@ -142,7 +144,10 @@ class AbsBotService:
                 clip_options = lookup_abs_clip_options(challenge)
                 clip = self._choose_clip_for_publish(challenge, clip_options)
                 if clip is None:
-                    if self._should_wait_for_clip(challenge):
+                    if self._should_wait_for_clip(
+                        challenge,
+                        game_is_terminal=self.client.is_terminal_game(game),
+                    ):
                         self._mark_clip_pending(
                             challenge.challenge_id,
                             available_clip_kind=(
@@ -233,6 +238,7 @@ class AbsBotService:
                 "pregame_poll_seconds": self.pregame_poll_seconds,
                 "clip_wait_seconds": self.clip_wait_seconds,
                 "raw_clip_wait_seconds": self.raw_clip_wait_seconds,
+                "final_clip_wait_seconds": self.final_clip_wait_seconds,
                 "games_checked_last_cycle": self.last_games_checked,
                 "feeds_checked_last_cycle": self.last_feeds_checked,
                 "active_games_last_cycle": self.last_active_games,
@@ -359,13 +365,14 @@ class AbsBotService:
             return None
         return clip_options.highlight_clip
 
-    def _should_wait_for_clip(self, challenge: Any) -> bool:
-        if self.clip_wait_seconds <= 0:
+    def _should_wait_for_clip(self, challenge: Any, *, game_is_terminal: bool) -> bool:
+        wait_seconds = self.final_clip_wait_seconds if game_is_terminal else self.clip_wait_seconds
+        if wait_seconds <= 0:
             return False
         age_seconds = self._clip_lookup_age_seconds(challenge)
         if age_seconds is None:
             return True
-        return age_seconds < self.clip_wait_seconds
+        return age_seconds < wait_seconds
 
     def _should_wait_for_raw_clip(self, challenge: Any) -> bool:
         if self.raw_clip_wait_seconds <= 0:
