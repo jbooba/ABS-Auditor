@@ -150,6 +150,14 @@ def format_x_post_text(challenge: AbsChallenge) -> str:
     return _format_compact_social_post(challenge, limit=280)
 
 
+def format_bluesky_clip_post_text(challenge: AbsChallenge, clip_url: str) -> str:
+    return _format_link_social_post(challenge, clip_url=clip_url, limit=300)
+
+
+def format_x_clip_post_text(challenge: AbsChallenge, clip_url: str) -> str:
+    return _format_link_social_post(challenge, clip_url=clip_url, limit=280)
+
+
 def _format_compact_social_post(challenge: AbsChallenge, *, limit: int) -> str:
     matchup_text = _matchup_with_tags(challenge.teams)
     if challenge.challenger_name == challenge.batter_name:
@@ -187,6 +195,15 @@ def _format_compact_social_post(challenge: AbsChallenge, *, limit: int) -> str:
         lines.append(result_line)
 
     return _fit_bluesky_text(lines, limit=limit)
+
+
+def _format_link_social_post(challenge: AbsChallenge, *, clip_url: str, limit: int) -> str:
+    reserved = min(40, len(clip_url) + 1)
+    body = _format_compact_social_post(challenge, limit=max(120, limit - reserved))
+    text = f"{body}\n{clip_url}"
+    if len(text) <= limit:
+        return text
+    return f"{_truncate_line(body, max(32, limit - reserved))}\n{clip_url}"
 
 
 def format_alt_text(challenge: AbsChallenge) -> str:

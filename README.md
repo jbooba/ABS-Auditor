@@ -2,7 +2,7 @@
 
 Standalone MLB ABS challenge monitor designed for Railway deployment.
 
-The app polls the MLB Stats API across a rolling UTC schedule window, detects completed ABS challenges, renders a challenge card, and posts it to any configured publishers.
+The app polls the MLB Stats API across a rolling UTC schedule window, detects completed ABS challenges, looks for official MLB challenge clips keyed by `play_id`, and posts them to any configured publishers with a graphic fallback when clips are delayed or unavailable.
 
 ## What It Does
 
@@ -10,8 +10,9 @@ The app polls the MLB Stats API across a rolling UTC schedule window, detects co
 - Sleeps when there are no live or imminent games, then wakes ahead of the next scheduled first pitch
 - Detects completed ABS challenges from `reviewDetails` / `playEvents`
 - Dedupes challenges across polling cycles with a local state file
+- Prefers official MLB clip discovery for each challenge before falling back to a rendered card
 - Tracks home-plate umpires and season-to-date challenge upheld rates
-- Renders a standalone challenge graphic
+- Renders a standalone challenge graphic when no usable official clip is available yet
 - Deletes posted image artifacts automatically unless you opt into keeping them
 - Posts challenge text + image to:
   - Discord webhook
@@ -64,6 +65,7 @@ Suggested Railway setup:
 - `ABS_OUTPUT_DIR`: image output directory, default `./output`
 - `ABS_STATE_FILE`: seen challenge + umpire stats state JSON, default `./state/seen_challenges.json`
 - `ABS_KEEP_ARTIFACTS`: keep generated card files after posting, default `0`
+- `ABS_CLIP_WAIT_SECONDS`: how long to keep retrying official MLB clip lookup before falling back to the rendered graphic, default `300`
 - `ABS_DISCORD_WEBHOOK_URL`: Discord webhook target
 - `ABS_BLUESKY_HANDLE`: BlueSky handle
 - `ABS_BLUESKY_APP_PASSWORD`: BlueSky app password
@@ -77,6 +79,7 @@ Suggested Railway setup:
 - The state file is local JSON. On Railway, move this to a persistent volume or database if you want dedupe and umpire challenge stats to survive redeploys and restarts.
 - The scheduler runs in UTC and watches yesterday/today/tomorrow for active games, while looking further ahead to decide when to wake for the next slate.
 - The bot prefers pitch-level `reviewDetails` when present. If MLB omits that, it falls back to the final pitch in the reviewed at-bat and records that selection reason in the output metadata.
+- Official MLB challenge clips are discovered from the game content feed, with `PlayId`-based Fastball search used as an identity hint to keep same-game challenge matches separated.
 - The displayed umpire rate is a challenge-specific upheld rate, not an all-pitches accuracy estimate.
 - The renderer writes PNG when Pillow is installed. If Pillow is unavailable, it falls back to SVG.
 - By default, service-mode artifacts are deleted after successful posting. Sample/manual runs still keep their rendered outputs.

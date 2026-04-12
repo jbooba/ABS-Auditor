@@ -8,7 +8,14 @@ from pathlib import Path
 from typing import List
 from urllib.request import Request, urlopen
 
-from .challenges import format_alt_text, format_bluesky_post_text, format_x_post_text
+from .challenges import (
+    format_alt_text,
+    format_bluesky_clip_post_text,
+    format_bluesky_post_text,
+    format_x_clip_post_text,
+    format_x_post_text,
+)
+from .clips import ClipMedia
 from .models import AbsChallenge
 
 
@@ -17,7 +24,14 @@ class Publisher:
     def delivery_key(self) -> str:
         raise NotImplementedError
 
-    def publish(self, challenge: AbsChallenge, text: str, image_path: Path) -> None:
+    def publish(
+        self,
+        challenge: AbsChallenge,
+        text: str,
+        image_path: Path | None,
+        *,
+        clip: ClipMedia | None = None,
+    ) -> None:
         raise NotImplementedError
 
 
@@ -29,7 +43,31 @@ class DiscordWebhookPublisher(Publisher):
     def delivery_key(self) -> str:
         return "discord"
 
-    def publish(self, challenge: AbsChallenge, text: str, image_path: Path) -> None:
+    def publish(
+        self,
+        challenge: AbsChallenge,
+        text: str,
+        image_path: Path | None,
+        *,
+        clip: ClipMedia | None = None,
+    ) -> None:
+        if clip is not None:
+            payload = {"content": f"{text}\n{clip.direct_url}".strip()}
+            request = Request(
+                self.webhook_url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json; charset=utf-8",
+                    "User-Agent": "mlb-abs-bot/0.1",
+                },
+                method="POST",
+            )
+            with urlopen(request, timeout=20) as response:
+                response.read()
+            return
+
+        if image_path is None:
+            raise RuntimeError("Discord image publishing requires an image path.")
         payload_json = json.dumps({"content": text})
         body, content_type = _multipart_encode(
             fields={"payload_json": payload_json},
@@ -55,7 +93,14 @@ class BlueSkyPublisher(Publisher):
     def delivery_key(self) -> str:
         return f"bluesky:{self.handle.lower()}"
 
-    def publish(self, challenge: AbsChallenge, text: str, image_path: Path) -> None:  # pragma: no cover - network integration
+    def publish(
+        self,
+        challenge: AbsChallenge,
+        text: str,
+        image_path: Path | None,
+        *,
+        clip: ClipMedia | None = None,
+    ) -> None:  # pragma: no cover - network integration
         try:
             from atproto import Client, models
         except ImportError as exc:
@@ -63,6 +108,12 @@ class BlueSkyPublisher(Publisher):
 
         client = Client()
         client.login(self.handle, self.app_password)
+        if clip is not None:
+            client.send_post(text=format_bluesky_clip_post_text(challenge, clip.page_url or clip.direct_url))
+            return
+
+        if image_path is None:
+            raise RuntimeError("BlueSky image publishing requires an image path.")
         with image_path.open("rb") as infile:
             blob = client.upload_blob(infile.read())
         client.send_post(
@@ -95,7 +146,14 @@ class XPublisher(Publisher):
     def delivery_key(self) -> str:
         return "x"
 
-    def publish(self, challenge: AbsChallenge, text: str, image_path: Path) -> None:  # pragma: no cover - network integration
+    def publish(
+        self,
+        challenge: AbsChallenge,
+        text: str,
+        image_path: Path | None,
+        *,
+        clip: ClipMedia | None = None,
+    ) -> None:  # pragma: no cover - network integration
         try:
             import tweepy
         except ImportError as exc:
@@ -108,13 +166,19 @@ class XPublisher(Publisher):
             self.access_token_secret,
         )
         api_v1 = tweepy.API(auth)
-        media = api_v1.media_upload(filename=str(image_path))
         client = tweepy.Client(
             consumer_key=self.api_key,
             consumer_secret=self.api_secret,
             access_token=self.access_token,
             access_token_secret=self.access_token_secret,
         )
+        if clip is not None:
+            client.create_tweet(text=format_x_clip_post_text(challenge, clip.page_url or clip.direct_url))
+            return
+
+        if image_path is None:
+            raise RuntimeError("X image publishing requires an image path.")
+        media = api_v1.media_upload(filename=str(image_path))
         client.create_tweet(text=format_x_post_text(challenge), media_ids=[media.media_id_string])
 
 

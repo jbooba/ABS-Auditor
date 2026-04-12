@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Deque, Dict, List, Set
 
 from .challenges import extract_abs_challenges, format_post_text
+from .clips import ClipMedia, lookup_best_abs_clip
 from .mlb import MlbStatsApiClient
 from .publishers import Publisher
 from .render import render_challenge_card
@@ -31,6 +32,7 @@ class AbsBotService:
         lookahead_days: int = 7,
         offseason_sleep_seconds: int = 21600,
         keep_artifacts: bool = False,
+        clip_wait_seconds: int = 300,
     ) -> None:
         self.client = client
         self.publishers = publishers
@@ -42,6 +44,7 @@ class AbsBotService:
         self.lookahead_days = lookahead_days
         self.offseason_sleep_seconds = offseason_sleep_seconds
         self.keep_artifacts = keep_artifacts
+        self.clip_wait_seconds = clip_wait_seconds
         self.stop_event = threading.Event()
         self.state_lock = threading.Lock()
         self.last_error: str | None = None
@@ -58,7 +61,12 @@ class AbsBotService:
         self.total_posts = 0
         self.recent_posts: Deque[Dict[str, Any]] = deque(maxlen=20)
         self.recent_failures: Deque[Dict[str, Any]] = deque(maxlen=20)
-        self.seen_challenge_ids, self.umpire_stats, self.publisher_delivery = self._load_state()
+        (
+            self.seen_challenge_ids,
+            self.umpire_stats,
+            self.publisher_delivery,
+            self.pending_clip_lookups,
+        ) = self._load_state()
         self.closed_game_pks: set[int] = set()
 
     def run_forever(self) -> None:
@@ -129,15 +137,22 @@ class AbsBotService:
                 if challenge.challenge_id in self.seen_challenge_ids:
                     continue
                 challenge = self._challenge_with_umpire_stats(challenge)
-                artifact_path = render_challenge_card(challenge, self.output_dir)
-                post_text = format_post_text(challenge)
+                clip = lookup_best_abs_clip(challenge)
+                if clip is None and self._should_wait_for_clip(challenge.challenge_id):
+                    self._mark_clip_pending(challenge.challenge_id)
+                    game_has_pending_delivery = True
+                    continue
+
+                self._clear_clip_pending(challenge.challenge_id)
+                artifact_path = None if clip else render_challenge_card(challenge, self.output_dir)
+                post_text = self._post_text_for_challenge(challenge, clip)
                 delivered_publishers = self.publisher_delivery.get(challenge.challenge_id, set())
                 publisher_failures: list[str] = []
                 for publisher in self.publishers:
                     if publisher.delivery_key in delivered_publishers:
                         continue
                     try:
-                        publisher.publish(challenge, post_text, artifact_path)
+                        publisher.publish(challenge, post_text, artifact_path, clip=clip)
                     except Exception as exc:
                         publisher_failures.append(f"{publisher.delivery_key}: {exc}")
                         continue
@@ -147,7 +162,7 @@ class AbsBotService:
                 if publisher_failures:
                     self._record_failures(challenge, publisher_failures)
 
-                artifact_retained = self.keep_artifacts or not self.publishers
+                artifact_retained = (self.keep_artifacts or not self.publishers) and artifact_path is not None
                 completed_this_cycle = self._publishers_complete(challenge.challenge_id)
                 if completed_this_cycle:
                     self._record_challenge(
@@ -155,9 +170,10 @@ class AbsBotService:
                         challenge,
                         artifact_path if artifact_retained else None,
                         post_text,
+                        clip=clip,
                         artifact_retained=artifact_retained,
-                )
-                if not artifact_retained:
+                    )
+                if artifact_path is not None and not artifact_retained:
                     artifact_path.unlink(missing_ok=True)
                 if completed_this_cycle:
                     new_posts += 1
@@ -199,6 +215,7 @@ class AbsBotService:
                 "last_poll_finished_at": self.last_poll_finished_at,
                 "poll_seconds": self.poll_seconds,
                 "pregame_poll_seconds": self.pregame_poll_seconds,
+                "clip_wait_seconds": self.clip_wait_seconds,
                 "games_checked_last_cycle": self.last_games_checked,
                 "feeds_checked_last_cycle": self.last_feeds_checked,
                 "active_games_last_cycle": self.last_active_games,
@@ -210,6 +227,7 @@ class AbsBotService:
                 "seen_challenges": len(self.seen_challenge_ids),
                 "tracked_umpires": len(self.umpire_stats),
                 "pending_publisher_deliveries": len(self.publisher_delivery),
+                "pending_clip_lookups": len(self.pending_clip_lookups),
                 "total_posts": self.total_posts,
                 "recent_posts": list(self.recent_posts),
                 "recent_failures": list(self.recent_failures),
@@ -222,11 +240,13 @@ class AbsBotService:
         artifact_path: Path | None,
         post_text: str,
         *,
+        clip: ClipMedia | None,
         artifact_retained: bool,
     ) -> None:
         with self.state_lock:
             self.seen_challenge_ids.add(challenge_id)
             self.publisher_delivery.pop(challenge_id, None)
+            self.pending_clip_lookups.pop(challenge_id, None)
             self._update_umpire_stats(challenge)
             self.recent_posts.appendleft(
                 {
@@ -238,6 +258,10 @@ class AbsBotService:
                     "outcome": challenge.outcome_label,
                     "artifact_path": str(artifact_path) if artifact_path else None,
                     "artifact_retained": artifact_retained,
+                    "clip_url": clip.direct_url if clip else None,
+                    "clip_page_url": clip.page_url if clip else None,
+                    "clip_host": clip.host if clip else None,
+                    "media_source": "clip" if clip else "graphic",
                     "posted_at": _utc_now_iso(),
                     "text": post_text,
                 }
@@ -265,23 +289,59 @@ class AbsBotService:
                 }
             )
 
+    def _post_text_for_challenge(self, challenge: Any, clip: ClipMedia | None) -> str:
+        text = format_post_text(challenge)
+        if clip is None:
+            return text
+        return f"{text}\nClip: {clip.page_url or clip.direct_url}".strip()
+
+    def _mark_clip_pending(self, challenge_id: str) -> None:
+        now_iso = _utc_now_iso()
+        with self.state_lock:
+            existing = self.pending_clip_lookups.get(challenge_id, {})
+            self.pending_clip_lookups[challenge_id] = {
+                "first_seen_at": str(existing.get("first_seen_at") or now_iso),
+                "last_checked_at": now_iso,
+                "attempts": int(existing.get("attempts", 0) or 0) + 1,
+            }
+            self._save_state()
+
+    def _clear_clip_pending(self, challenge_id: str) -> None:
+        with self.state_lock:
+            if challenge_id not in self.pending_clip_lookups:
+                return
+            self.pending_clip_lookups.pop(challenge_id, None)
+            self._save_state()
+
+    def _should_wait_for_clip(self, challenge_id: str) -> bool:
+        if self.clip_wait_seconds <= 0:
+            return False
+        with self.state_lock:
+            existing = self.pending_clip_lookups.get(challenge_id)
+        if not existing:
+            return True
+        first_seen_at = _parse_iso(existing.get("first_seen_at"))
+        if first_seen_at is None:
+            return True
+        return (datetime.now(timezone.utc) - first_seen_at).total_seconds() < self.clip_wait_seconds
+
     def _publishers_complete(self, challenge_id: str) -> bool:
         if not self.publishers:
             return True
         delivered = self.publisher_delivery.get(challenge_id, set())
         return all(publisher.delivery_key in delivered for publisher in self.publishers)
 
-    def _load_state(self) -> tuple[set[str], dict[str, Dict[str, Any]], dict[str, Set[str]]]:
+    def _load_state(self) -> tuple[set[str], dict[str, Dict[str, Any]], dict[str, Set[str]], dict[str, Dict[str, Any]]]:
         if not self.state_file.exists():
-            return set(), {}, {}
+            return set(), {}, {}, {}
         try:
             payload = json.loads(self.state_file.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
-            return set(), {}, {}
+            return set(), {}, {}, {}
         if isinstance(payload, list):
-            return {str(item) for item in payload}, {}, {}
+            return {str(item) for item in payload}, {}, {}, {}
         if not isinstance(payload, dict):
-            return set(), {}, {}
+            return set(), {}, {}, {}
 
         payload_version = int(payload.get("state_version", 0) or 0)
         seen_ids: set[str] = set()
@@ -310,7 +370,18 @@ class AbsBotService:
                         for item in value
                         if item is not None
                     }
-        return seen_ids, umpire_stats, publisher_delivery
+        pending_clip_lookups: dict[str, Dict[str, Any]] = {}
+        pending_payload = payload.get("pending_clip_lookups", {})
+        if payload_version == STATE_VERSION and isinstance(pending_payload, dict):
+            for key, value in pending_payload.items():
+                if not isinstance(value, dict):
+                    continue
+                pending_clip_lookups[str(key)] = {
+                    "first_seen_at": str(value.get("first_seen_at", "")),
+                    "last_checked_at": str(value.get("last_checked_at", "")),
+                    "attempts": int(value.get("attempts", 0) or 0),
+                }
+        return seen_ids, umpire_stats, publisher_delivery, pending_clip_lookups
 
     def _save_state(self) -> None:
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
@@ -324,6 +395,7 @@ class AbsBotService:
                         key: sorted(value)
                         for key, value in self.publisher_delivery.items()
                     },
+                    "pending_clip_lookups": self.pending_clip_lookups,
                 },
                 indent=2,
             ),
@@ -448,6 +520,15 @@ def _utc_now_iso() -> str:
 
 def _utc_after_seconds_iso(seconds: float) -> str:
     return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat()
+
+
+def _parse_iso(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(timezone.utc)
+    except ValueError:
+        return None
 
 
 def _game_time_iso(client: MlbStatsApiClient, game: Dict[str, Any] | None) -> str | None:
