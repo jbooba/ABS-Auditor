@@ -194,6 +194,7 @@ def _score_content_item(
     keyword_text = " ".join(part for part in keyword_values if part)
     search_text = " ".join(part for part in [combined_text, slug_text, keyword_text] if part)
 
+    player_signals = 0
     score = 0
     if "abs" in search_text:
         score += 120
@@ -212,6 +213,7 @@ def _score_content_item(
         normalized_name = _normalize_text(name)
         if normalized_name and normalized_name in search_text:
             score += weight
+            player_signals += 1
 
     inning_half = _normalize_text(challenge.half_inning)
     inning_num = str(challenge.inning)
@@ -233,6 +235,8 @@ def _score_content_item(
     if exact_media_text:
         overlap = len(_token_set(search_text) & _token_set(exact_media_text))
         score += min(160, overlap * 20)
+        if overlap >= 2:
+            player_signals += 1
 
     game_pk_text = str(challenge.game_pk)
     if any(game_pk_text in text for text in keyword_values):
@@ -244,6 +248,13 @@ def _score_content_item(
     }
     if any(host in ALLOWED_CLIP_HOSTS for host in clip_hosts):
         score += 25
+
+    has_generic_review_title = (
+        ("abs" in search_text or "challenge" in search_text or "capture review" in search_text)
+        and player_signals == 0
+    )
+    if has_generic_review_title:
+        return 0
 
     return score
 

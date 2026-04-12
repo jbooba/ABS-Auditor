@@ -194,7 +194,7 @@ class XPublisher(Publisher):
             client.create_tweet(
                 text=format_x_clip_post_text(
                     challenge,
-                    clip.social_url or clip.page_url or clip.direct_url,
+                    clip.page_url or clip.social_url or clip.direct_url,
                 )
             )
             return
