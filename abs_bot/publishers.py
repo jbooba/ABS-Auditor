@@ -1,17 +1,25 @@
 from __future__ import annotations
 
 import json
+import io
 import mimetypes
 import os
+import tempfile
+import time
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.error import HTTPError
+from urllib.parse import urlencode, urlparse
 from typing import List
 from urllib.request import Request, urlopen
 
 from .challenges import (
     format_alt_text,
+    format_clip_alt_text,
     format_bluesky_clip_embed_text,
     format_bluesky_post_text,
+    format_x_clip_native_post_text,
     format_x_clip_post_text,
     format_x_post_text,
 )
@@ -101,6 +109,31 @@ class BlueSkyPublisher(Publisher):
         *,
         clip: ClipMedia | None = None,
     ) -> None:  # pragma: no cover - network integration
+        if clip is not None:
+            if not _is_mp4_url(clip.direct_url):
+                try:
+                    from atproto import Client
+                except ImportError as exc:
+                    raise RuntimeError("BlueSky publishing requires the 'atproto' package.") from exc
+                client = Client()
+                client.login(self.handle, self.app_password)
+                _publish_bluesky_external_clip(client, challenge, clip)
+                return
+            clip_path = _download_clip_to_temp(clip.direct_url)
+            try:
+                session = _create_bluesky_session(self.handle, self.app_password)
+                video_blob = _upload_bluesky_native_video(session, clip_path)
+                _create_bluesky_video_post(
+                    session=session,
+                    text=format_bluesky_clip_embed_text(challenge),
+                    video_blob=video_blob,
+                    alt_text=format_clip_alt_text(challenge),
+                    aspect_ratio=_clip_aspect_ratio(clip),
+                )
+            finally:
+                clip_path.unlink(missing_ok=True)
+            return
+
         try:
             from atproto import Client, models
         except ImportError as exc:
@@ -108,28 +141,6 @@ class BlueSkyPublisher(Publisher):
 
         client = Client()
         client.login(self.handle, self.app_password)
-        if clip is not None:
-            thumb_blob = None
-            try:
-                thumb_blob = _upload_bluesky_thumb(client, clip.thumbnail_url)
-            except Exception:
-                thumb_blob = None
-            external_kwargs = {
-                "uri": clip.social_url or clip.page_url or clip.direct_url,
-                "title": _truncate_embed_text(clip.title, 100),
-                "description": _truncate_embed_text(clip.description or clip.title, 280),
-            }
-            if thumb_blob is not None:
-                external_kwargs["thumb"] = thumb_blob
-
-            client.send_post(
-                text=format_bluesky_clip_embed_text(challenge),
-                embed=models.AppBskyEmbedExternal.Main(
-                    external=models.AppBskyEmbedExternal.External(**external_kwargs)
-                ),
-            )
-            return
-
         if image_path is None:
             raise RuntimeError("BlueSky image publishing requires an image path.")
         with image_path.open("rb") as infile:
@@ -191,11 +202,27 @@ class XPublisher(Publisher):
             access_token_secret=self.access_token_secret,
         )
         if clip is not None:
-            client.create_tweet(
-                text=format_x_clip_post_text(
-                    challenge,
-                    clip.page_url or clip.social_url or clip.direct_url,
+            if not _is_mp4_url(clip.direct_url):
+                client.create_tweet(
+                    text=format_x_clip_post_text(
+                        challenge,
+                        clip.page_url or clip.social_url or clip.direct_url,
+                    )
                 )
+                return
+            clip_path = _download_clip_to_temp(clip.direct_url)
+            try:
+                media = api_v1.chunked_upload(
+                    filename=str(clip_path),
+                    file_type="video/mp4",
+                    wait_for_async_finalize=True,
+                    media_category="tweet_video",
+                )
+            finally:
+                clip_path.unlink(missing_ok=True)
+            client.create_tweet(
+                text=format_x_clip_native_post_text(challenge),
+                media_ids=[media.media_id_string],
             )
             return
 
@@ -287,6 +314,249 @@ def _upload_bluesky_thumb(client: object, thumbnail_url: str) -> object | None:
         return None
     upload = client.upload_blob(data)
     return upload.blob
+
+
+def _download_clip_to_temp(clip_url: str) -> Path:
+    suffix = Path(urlparse(clip_url).path).suffix or ".mp4"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        request = Request(
+            clip_url,
+            headers={"User-Agent": "mlb-abs-bot/0.1"},
+        )
+        with urlopen(request, timeout=60) as response:
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                tmp.write(chunk)
+        return Path(tmp.name)
+
+
+def _is_mp4_url(url: str) -> bool:
+    path = urlparse(url).path.lower()
+    return path.endswith(".mp4")
+
+
+def _clip_aspect_ratio(clip: ClipMedia) -> dict[str, int] | None:
+    if not clip.thumbnail_url:
+        return None
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+    request = Request(
+        clip.thumbnail_url,
+        headers={"User-Agent": "mlb-abs-bot/0.1"},
+    )
+    try:
+        with urlopen(request, timeout=20) as response:
+            data = response.read()
+    except Exception:
+        return None
+    if not data:
+        return None
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            width, height = image.size
+    except Exception:
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    return {"width": int(width), "height": int(height)}
+
+
+def _create_bluesky_session(handle: str, app_password: str) -> dict:
+    request = Request(
+        "https://bsky.social/xrpc/com.atproto.server.createSession",
+        data=json.dumps(
+            {
+                "identifier": handle,
+                "password": app_password,
+            }
+        ).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json; charset=utf-8",
+            "User-Agent": "mlb-abs-bot/0.1",
+        },
+        method="POST",
+    )
+    return _read_json_response(request)
+
+
+def _upload_bluesky_native_video(session: dict, clip_path: Path) -> dict:
+    service_token = _get_bluesky_service_auth(
+        access_jwt=str(session["accessJwt"]),
+        audience=f"did:web:{urlparse('https://bsky.social').hostname}",
+        lxm="com.atproto.repo.uploadBlob",
+    )
+    upload_url = (
+        "https://video.bsky.app/xrpc/app.bsky.video.uploadVideo?"
+        + urlencode(
+            {
+                "did": str(session["did"]),
+                "name": clip_path.name,
+            }
+        )
+    )
+    request = Request(
+        upload_url,
+        data=clip_path.read_bytes(),
+        headers={
+            "Authorization": f"Bearer {service_token}",
+            "Content-Type": "video/mp4",
+            "User-Agent": "mlb-abs-bot/0.1",
+        },
+        method="POST",
+    )
+    payload = _read_json_response(request, allow_error_json=True)
+    job_status = _extract_bluesky_job_status(payload)
+    blob = _extract_bluesky_blob(job_status)
+    if blob is not None:
+        return blob
+    job_id = str(job_status.get("jobId") or "")
+    if not job_id:
+        raise RuntimeError("BlueSky video upload did not return a job ID.")
+
+    deadline = time.monotonic() + 300.0
+    while time.monotonic() < deadline:
+        status_request = Request(
+            "https://video.bsky.app/xrpc/app.bsky.video.getJobStatus?" + urlencode({"jobId": job_id}),
+            headers={"User-Agent": "mlb-abs-bot/0.1"},
+            method="GET",
+        )
+        status_payload = _read_json_response(status_request, allow_error_json=True)
+        status = _extract_bluesky_job_status(status_payload)
+        blob = _extract_bluesky_blob(status)
+        if blob is not None:
+            return blob
+
+        state = str(status.get("state") or "").lower()
+        if state == "failed":
+            message = str(status.get("message") or "BlueSky video processing failed.")
+            raise RuntimeError(message)
+
+        time.sleep(1.0)
+
+    raise RuntimeError("Timed out waiting for BlueSky video processing.")
+
+
+def _get_bluesky_service_auth(*, access_jwt: str, audience: str, lxm: str) -> str:
+    expires_at = int((datetime.now(timezone.utc) + timedelta(minutes=30)).timestamp())
+    request = Request(
+        "https://bsky.social/xrpc/com.atproto.server.getServiceAuth?"
+        + urlencode({"aud": audience, "lxm": lxm, "exp": expires_at}),
+        headers={
+            "Authorization": f"Bearer {access_jwt}",
+            "User-Agent": "mlb-abs-bot/0.1",
+        },
+        method="GET",
+    )
+    payload = _read_json_response(request)
+    token = str(payload.get("token") or "")
+    if not token:
+        raise RuntimeError("BlueSky did not return a service auth token.")
+    return token
+
+
+def _create_bluesky_video_post(
+    *,
+    session: dict,
+    text: str,
+    video_blob: dict,
+    alt_text: str,
+    aspect_ratio: dict[str, int] | None,
+) -> None:
+    embed = {
+        "$type": "app.bsky.embed.video",
+        "video": video_blob,
+        "alt": alt_text,
+    }
+    if aspect_ratio is not None:
+        embed["aspectRatio"] = aspect_ratio
+
+    payload = {
+        "repo": str(session["did"]),
+        "collection": "app.bsky.feed.post",
+        "record": {
+            "$type": "app.bsky.feed.post",
+            "text": text,
+            "createdAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "langs": ["en"],
+            "embed": embed,
+        },
+    }
+    request = Request(
+        "https://bsky.social/xrpc/com.atproto.repo.createRecord",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {session['accessJwt']}",
+            "Content-Type": "application/json; charset=utf-8",
+            "User-Agent": "mlb-abs-bot/0.1",
+        },
+        method="POST",
+    )
+    _read_json_response(request)
+
+
+def _publish_bluesky_external_clip(client: object, challenge: AbsChallenge, clip: ClipMedia) -> None:
+    try:
+        from atproto import models
+    except ImportError as exc:
+        raise RuntimeError("BlueSky publishing requires the 'atproto' package.") from exc
+
+    thumb_blob = None
+    try:
+        thumb_blob = _upload_bluesky_thumb(client, clip.thumbnail_url)
+    except Exception:
+        thumb_blob = None
+
+    external_kwargs = {
+        "uri": clip.social_url or clip.page_url or clip.direct_url,
+        "title": _truncate_embed_text(clip.title, 100),
+        "description": _truncate_embed_text(clip.description or clip.title, 280),
+    }
+    if thumb_blob is not None:
+        external_kwargs["thumb"] = thumb_blob
+
+    client.send_post(
+        text=format_bluesky_clip_embed_text(challenge),
+        embed=models.AppBskyEmbedExternal.Main(
+            external=models.AppBskyEmbedExternal.External(**external_kwargs)
+        ),
+    )
+
+
+def _extract_bluesky_job_status(payload: dict) -> dict:
+    job_status = payload.get("jobStatus")
+    if isinstance(job_status, dict):
+        return job_status
+    return payload
+
+
+def _extract_bluesky_blob(payload: dict) -> dict | None:
+    blob = payload.get("blob")
+    if isinstance(blob, dict):
+        return blob
+    error = payload.get("error")
+    if error == "already_exists":
+        inner_blob = payload.get("blob")
+        if isinstance(inner_blob, dict):
+            return inner_blob
+    return None
+
+
+def _read_json_response(request: Request, *, allow_error_json: bool = False) -> dict:
+    try:
+        with urlopen(request, timeout=60) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        if allow_error_json:
+            try:
+                return json.loads(body)
+            except json.JSONDecodeError:
+                pass
+        raise RuntimeError(f"HTTP {exc.code}: {body}") from exc
 
 
 def _truncate_embed_text(text: str, limit: int) -> str:

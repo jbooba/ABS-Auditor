@@ -164,6 +164,10 @@ def format_bluesky_clip_embed_text(challenge: AbsChallenge) -> str:
     return _format_clip_social_post(challenge, limit=300)
 
 
+def format_x_clip_native_post_text(challenge: AbsChallenge) -> str:
+    return _format_clip_social_post(challenge, limit=280)
+
+
 def format_x_clip_post_text(challenge: AbsChallenge, clip_url: str) -> str:
     return _format_link_social_post(
         challenge,
@@ -272,6 +276,18 @@ def format_alt_text(challenge: AbsChallenge) -> str:
         f"{at_bat_sentence}"
         f"Pitch tracked at px {challenge.pitch.px}, pz {challenge.pitch.pz}."
     )
+
+
+def format_clip_alt_text(challenge: AbsChallenge) -> str:
+    parts = [
+        f"Official MLB video clip of an ABS challenge in {challenge.teams.matchup_label} during {challenge.inning_label}.",
+        f"Challenge by {challenge.challenger_name}.",
+        f"Original call {challenge.original_call}.",
+        f"ABS result {challenge.final_call}.",
+    ]
+    if challenge.at_bat_result_display:
+        parts.append(challenge.at_bat_result_display)
+    return " ".join(parts)
 
 
 def _call_transition_text(challenge: AbsChallenge) -> str:
