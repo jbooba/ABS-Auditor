@@ -293,7 +293,7 @@ class AbsBotService:
         text = format_post_text(challenge)
         if clip is None:
             return text
-        return f"{text}\nClip: {clip.page_url or clip.direct_url}".strip()
+        return f"{text}\nClip: {clip.direct_url}".strip()
 
     def _mark_clip_pending(self, challenge_id: str) -> None:
         now_iso = _utc_now_iso()

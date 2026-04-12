@@ -109,7 +109,7 @@ class BlueSkyPublisher(Publisher):
         client = Client()
         client.login(self.handle, self.app_password)
         if clip is not None:
-            client.send_post(text=format_bluesky_clip_post_text(challenge, clip.page_url or clip.direct_url))
+            client.send_post(text=format_bluesky_clip_post_text(challenge, clip.direct_url))
             return
 
         if image_path is None:
@@ -173,7 +173,7 @@ class XPublisher(Publisher):
             access_token_secret=self.access_token_secret,
         )
         if clip is not None:
-            client.create_tweet(text=format_x_clip_post_text(challenge, clip.page_url or clip.direct_url))
+            client.create_tweet(text=format_x_clip_post_text(challenge, clip.direct_url))
             return
 
         if image_path is None:
