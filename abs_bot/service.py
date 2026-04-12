@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Deque, Dict, List, Set
 
 from .challenges import extract_abs_challenges, format_post_text
-from .clips import ClipMedia, lookup_best_abs_clip
+from .clips import ClipMedia, ClipLookupResult, lookup_abs_clip_options
 from .mlb import MlbStatsApiClient
 from .publishers import Publisher
 from .render import render_challenge_card
@@ -33,6 +33,7 @@ class AbsBotService:
         offseason_sleep_seconds: int = 21600,
         keep_artifacts: bool = False,
         clip_wait_seconds: int = 300,
+        raw_clip_wait_seconds: int = 120,
     ) -> None:
         self.client = client
         self.publishers = publishers
@@ -45,6 +46,7 @@ class AbsBotService:
         self.offseason_sleep_seconds = offseason_sleep_seconds
         self.keep_artifacts = keep_artifacts
         self.clip_wait_seconds = clip_wait_seconds
+        self.raw_clip_wait_seconds = raw_clip_wait_seconds
         self.stop_event = threading.Event()
         self.state_lock = threading.Lock()
         self.last_error: str | None = None
@@ -137,11 +139,25 @@ class AbsBotService:
                 if challenge.challenge_id in self.seen_challenge_ids:
                     continue
                 challenge = self._challenge_with_umpire_stats(challenge)
-                clip = lookup_best_abs_clip(challenge)
-                if clip is None and self._should_wait_for_clip(challenge.challenge_id):
-                    self._mark_clip_pending(challenge.challenge_id)
-                    game_has_pending_delivery = True
-                    continue
+                clip_options = lookup_abs_clip_options(challenge)
+                clip = self._choose_clip_for_publish(challenge, clip_options)
+                if clip is None:
+                    if self._should_wait_for_clip(challenge):
+                        self._mark_clip_pending(
+                            challenge.challenge_id,
+                            available_clip_kind=(
+                                "highlight"
+                                if clip_options.highlight_clip is not None
+                                else None
+                            ),
+                            available_clip_host=(
+                                clip_options.highlight_clip.host
+                                if clip_options.highlight_clip is not None
+                                else None
+                            ),
+                        )
+                        game_has_pending_delivery = True
+                        continue
 
                 self._clear_clip_pending(challenge.challenge_id)
                 artifact_path = None if clip else render_challenge_card(challenge, self.output_dir)
@@ -216,6 +232,7 @@ class AbsBotService:
                 "poll_seconds": self.poll_seconds,
                 "pregame_poll_seconds": self.pregame_poll_seconds,
                 "clip_wait_seconds": self.clip_wait_seconds,
+                "raw_clip_wait_seconds": self.raw_clip_wait_seconds,
                 "games_checked_last_cycle": self.last_games_checked,
                 "feeds_checked_last_cycle": self.last_feeds_checked,
                 "active_games_last_cycle": self.last_active_games,
@@ -295,7 +312,13 @@ class AbsBotService:
             return text
         return f"{text}\nClip: {clip.direct_url}".strip()
 
-    def _mark_clip_pending(self, challenge_id: str) -> None:
+    def _mark_clip_pending(
+        self,
+        challenge_id: str,
+        *,
+        available_clip_kind: str | None = None,
+        available_clip_host: str | None = None,
+    ) -> None:
         now_iso = _utc_now_iso()
         with self.state_lock:
             existing = self.pending_clip_lookups.get(challenge_id, {})
@@ -303,6 +326,16 @@ class AbsBotService:
                 "first_seen_at": str(existing.get("first_seen_at") or now_iso),
                 "last_checked_at": now_iso,
                 "attempts": int(existing.get("attempts", 0) or 0) + 1,
+                "available_clip_kind": str(
+                    available_clip_kind
+                    or existing.get("available_clip_kind")
+                    or ""
+                ),
+                "available_clip_host": str(
+                    available_clip_host
+                    or existing.get("available_clip_host")
+                    or ""
+                ),
             }
             self._save_state()
 
@@ -313,17 +346,48 @@ class AbsBotService:
             self.pending_clip_lookups.pop(challenge_id, None)
             self._save_state()
 
-    def _should_wait_for_clip(self, challenge_id: str) -> bool:
+    def _choose_clip_for_publish(
+        self,
+        challenge: Any,
+        clip_options: ClipLookupResult,
+    ) -> ClipMedia | None:
+        if clip_options.raw_clip is not None:
+            return clip_options.raw_clip
+        if clip_options.highlight_clip is None:
+            return None
+        if self._should_wait_for_raw_clip(challenge):
+            return None
+        return clip_options.highlight_clip
+
+    def _should_wait_for_clip(self, challenge: Any) -> bool:
         if self.clip_wait_seconds <= 0:
             return False
-        with self.state_lock:
-            existing = self.pending_clip_lookups.get(challenge_id)
-        if not existing:
+        age_seconds = self._clip_lookup_age_seconds(challenge)
+        if age_seconds is None:
             return True
+        return age_seconds < self.clip_wait_seconds
+
+    def _should_wait_for_raw_clip(self, challenge: Any) -> bool:
+        if self.raw_clip_wait_seconds <= 0:
+            return False
+        age_seconds = self._clip_lookup_age_seconds(challenge)
+        if age_seconds is None:
+            return True
+        return age_seconds < self.raw_clip_wait_seconds
+
+    def _clip_lookup_age_seconds(self, challenge: Any) -> float | None:
+        play_end_time = _parse_iso(getattr(challenge, "play_end_time", None))
+        if play_end_time is not None:
+            return max(0.0, (datetime.now(timezone.utc) - play_end_time).total_seconds())
+
+        with self.state_lock:
+            existing = self.pending_clip_lookups.get(challenge.challenge_id)
+        if not existing:
+            return None
         first_seen_at = _parse_iso(existing.get("first_seen_at"))
         if first_seen_at is None:
-            return True
-        return (datetime.now(timezone.utc) - first_seen_at).total_seconds() < self.clip_wait_seconds
+            return None
+        return max(0.0, (datetime.now(timezone.utc) - first_seen_at).total_seconds())
 
     def _publishers_complete(self, challenge_id: str) -> bool:
         if not self.publishers:
@@ -380,6 +444,8 @@ class AbsBotService:
                     "first_seen_at": str(value.get("first_seen_at", "")),
                     "last_checked_at": str(value.get("last_checked_at", "")),
                     "attempts": int(value.get("attempts", 0) or 0),
+                    "available_clip_kind": str(value.get("available_clip_kind", "")),
+                    "available_clip_host": str(value.get("available_clip_host", "")),
                 }
         return seen_ids, umpire_stats, publisher_delivery, pending_clip_lookups
 

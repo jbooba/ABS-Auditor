@@ -30,6 +30,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--offseason-sleep-seconds", type=int, default=int(os.getenv("ABS_OFFSEASON_SLEEP_SECONDS", "21600")))
     parser.add_argument("--keep-artifacts", action="store_true", default=_env_flag("ABS_KEEP_ARTIFACTS", False))
     parser.add_argument("--clip-wait-seconds", type=int, default=int(os.getenv("ABS_CLIP_WAIT_SECONDS", "300")))
+    parser.add_argument("--raw-clip-wait-seconds", type=int, default=int(os.getenv("ABS_RAW_CLIP_WAIT_SECONDS", "120")))
     parser.add_argument("--port", type=int, default=int(os.getenv("PORT", "8080")))
     parser.add_argument("--once", action="store_true", help="Run a single pass and exit")
     return parser.parse_args()
@@ -55,6 +56,7 @@ def main() -> int:
         offseason_sleep_seconds=args.offseason_sleep_seconds,
         keep_artifacts=args.keep_artifacts,
         clip_wait_seconds=args.clip_wait_seconds,
+        raw_clip_wait_seconds=args.raw_clip_wait_seconds,
     )
 
     if args.once:

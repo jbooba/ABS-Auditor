@@ -35,9 +35,23 @@ class ClipMedia:
     score: int
 
 
+@dataclass(frozen=True)
+class ClipLookupResult:
+    raw_clip: ClipMedia | None
+    highlight_clip: ClipMedia | None
+
+    @property
+    def best_available(self) -> ClipMedia | None:
+        return self.raw_clip or self.highlight_clip
+
+
 def lookup_best_abs_clip(challenge: AbsChallenge) -> Optional[ClipMedia]:
+    return lookup_abs_clip_options(challenge).best_available
+
+
+def lookup_abs_clip_options(challenge: AbsChallenge) -> ClipLookupResult:
     if not challenge.pitch.play_id:
-        return None
+        return ClipLookupResult(raw_clip=None, highlight_clip=None)
 
     exact_media = _fetch_fastball_play_media(challenge.pitch.play_id)
     exact_media_text = _normalize_text(
@@ -83,22 +97,12 @@ def lookup_best_abs_clip(challenge: AbsChallenge) -> Optional[ClipMedia]:
             )
 
     if not candidates:
-        return None
+        return ClipLookupResult(raw_clip=None, highlight_clip=None)
 
-    candidates.sort(
-        key=lambda clip: (
-            clip.clip_kind != "raw",
-            -clip.score,
-            clip.title.lower(),
-        )
+    return ClipLookupResult(
+        raw_clip=_choose_best_clip(candidates, clip_kind="raw"),
+        highlight_clip=_choose_best_clip(candidates, clip_kind="highlight"),
     )
-    seen_urls: set[str] = set()
-    for clip in candidates:
-        if clip.direct_url in seen_urls:
-            continue
-        seen_urls.add(clip.direct_url)
-        return clip
-    return None
 
 
 @lru_cache(maxsize=512)
@@ -257,6 +261,31 @@ def _playback_rank(host: str, playback_name: str) -> int:
         if "hls" in playback_name or "cloud" in playback_name:
             return 260
     return 0
+
+
+def _choose_best_clip(candidates: list[ClipMedia], *, clip_kind: str) -> ClipMedia | None:
+    ranked = [
+        clip
+        for clip in candidates
+        if clip.clip_kind == clip_kind
+    ]
+    if not ranked:
+        return None
+
+    ranked.sort(
+        key=lambda clip: (
+            -clip.score,
+            clip.title.lower(),
+            clip.direct_url,
+        )
+    )
+    seen_urls: set[str] = set()
+    for clip in ranked:
+        if clip.direct_url in seen_urls:
+            continue
+        seen_urls.add(clip.direct_url)
+        return clip
+    return None
 
 
 def _clip_host_from_url(url: str) -> str:
