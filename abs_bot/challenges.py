@@ -160,6 +160,10 @@ def format_bluesky_clip_post_text(challenge: AbsChallenge, clip_url: str) -> str
     )
 
 
+def format_bluesky_clip_embed_text(challenge: AbsChallenge) -> str:
+    return _format_clip_social_post(challenge, limit=300)
+
+
 def format_x_clip_post_text(challenge: AbsChallenge, clip_url: str) -> str:
     return _format_link_social_post(
         challenge,

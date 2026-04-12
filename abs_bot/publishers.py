@@ -10,7 +10,7 @@ from urllib.request import Request, urlopen
 
 from .challenges import (
     format_alt_text,
-    format_bluesky_clip_post_text,
+    format_bluesky_clip_embed_text,
     format_bluesky_post_text,
     format_x_clip_post_text,
     format_x_post_text,
@@ -109,7 +109,25 @@ class BlueSkyPublisher(Publisher):
         client = Client()
         client.login(self.handle, self.app_password)
         if clip is not None:
-            client.send_post(text=format_bluesky_clip_post_text(challenge, clip.direct_url))
+            thumb_blob = None
+            try:
+                thumb_blob = _upload_bluesky_thumb(client, clip.thumbnail_url)
+            except Exception:
+                thumb_blob = None
+            external_kwargs = {
+                "uri": clip.page_url or clip.direct_url,
+                "title": _truncate_embed_text(clip.title, 100),
+                "description": _truncate_embed_text(clip.description or clip.title, 280),
+            }
+            if thumb_blob is not None:
+                external_kwargs["thumb"] = thumb_blob
+
+            client.send_post(
+                text=format_bluesky_clip_embed_text(challenge),
+                embed=models.AppBskyEmbedExternal.Main(
+                    external=models.AppBskyEmbedExternal.External(**external_kwargs)
+                ),
+            )
             return
 
         if image_path is None:
@@ -173,7 +191,7 @@ class XPublisher(Publisher):
             access_token_secret=self.access_token_secret,
         )
         if clip is not None:
-            client.create_tweet(text=format_x_clip_post_text(challenge, clip.direct_url))
+            client.create_tweet(text=format_x_clip_post_text(challenge, clip.page_url or clip.direct_url))
             return
 
         if image_path is None:
@@ -246,3 +264,32 @@ def _multipart_encode(
     )
 
     return b"".join(chunks), f"multipart/form-data; boundary={boundary}"
+
+
+def _upload_bluesky_thumb(client: object, thumbnail_url: str) -> object | None:
+    if not thumbnail_url:
+        return None
+    request = Request(
+        thumbnail_url,
+        headers={"User-Agent": "mlb-abs-bot/0.1"},
+    )
+    with urlopen(request, timeout=20) as response:
+        content_type = response.headers.get_content_type()
+        if not content_type.startswith("image/"):
+            return None
+        data = response.read()
+    if not data:
+        return None
+    upload = client.upload_blob(data)
+    return upload.blob
+
+
+def _truncate_embed_text(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    if limit <= 3:
+        return text[:limit]
+    trimmed = text[: limit - 3].rstrip()
+    if " " in trimmed:
+        trimmed = trimmed.rsplit(" ", 1)[0]
+    return f"{trimmed}..."
