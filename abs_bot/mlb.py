@@ -108,6 +108,10 @@ class MlbStatsApiClient:
         return game.get("status", {}).get("detailedState", "").strip()
 
     @staticmethod
+    def game_type(game: Dict[str, Any]) -> str:
+        return str(game.get("gameType", "")).strip()
+
+    @staticmethod
     def abstract_state(game: Dict[str, Any]) -> str:
         return game.get("status", {}).get("abstractGameState", "").strip()
 

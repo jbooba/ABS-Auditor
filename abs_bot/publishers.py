@@ -32,6 +32,15 @@ class Publisher:
     def delivery_key(self) -> str:
         raise NotImplementedError
 
+    def publish_media_post(
+        self,
+        text: str,
+        image_path: Path | None = None,
+        *,
+        alt_text: str = "",
+    ) -> None:
+        raise NotImplementedError
+
     def publish(
         self,
         challenge: AbsChallenge,
@@ -76,6 +85,43 @@ class DiscordWebhookPublisher(Publisher):
 
         if image_path is None:
             raise RuntimeError("Discord image publishing requires an image path.")
+        payload_json = json.dumps({"content": text})
+        body, content_type = _multipart_encode(
+            fields={"payload_json": payload_json},
+            file_field="files[0]",
+            file_path=image_path,
+        )
+        request = Request(
+            self.webhook_url,
+            data=body,
+            headers={"Content-Type": content_type, "User-Agent": "mlb-abs-bot/0.1"},
+            method="POST",
+        )
+        with urlopen(request, timeout=20) as response:
+            response.read()
+
+    def publish_media_post(
+        self,
+        text: str,
+        image_path: Path | None = None,
+        *,
+        alt_text: str = "",
+    ) -> None:
+        if image_path is None:
+            payload = {"content": text}
+            request = Request(
+                self.webhook_url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json; charset=utf-8",
+                    "User-Agent": "mlb-abs-bot/0.1",
+                },
+                method="POST",
+            )
+            with urlopen(request, timeout=20) as response:
+                response.read()
+            return
+
         payload_json = json.dumps({"content": text})
         body, content_type = _multipart_encode(
             fields={"payload_json": payload_json},
@@ -157,6 +203,38 @@ class BlueSkyPublisher(Publisher):
             ),
         )
 
+    def publish_media_post(
+        self,
+        text: str,
+        image_path: Path | None = None,
+        *,
+        alt_text: str = "",
+    ) -> None:  # pragma: no cover - network integration
+        try:
+            from atproto import Client, models
+        except ImportError as exc:
+            raise RuntimeError("BlueSky publishing requires the 'atproto' package.") from exc
+
+        client = Client()
+        client.login(self.handle, self.app_password)
+        if image_path is None:
+            client.send_post(text=text)
+            return
+
+        with image_path.open("rb") as infile:
+            blob = client.upload_blob(infile.read())
+        client.send_post(
+            text=text,
+            embed=models.AppBskyEmbedImages.Main(
+                images=[
+                    models.AppBskyEmbedImages.Image(
+                        image=blob.blob,
+                        alt=alt_text or "",
+                    )
+                ]
+            ),
+        )
+
 
 class XPublisher(Publisher):
     def __init__(
@@ -230,6 +308,37 @@ class XPublisher(Publisher):
             raise RuntimeError("X image publishing requires an image path.")
         media = api_v1.media_upload(filename=str(image_path))
         client.create_tweet(text=format_x_post_text(challenge), media_ids=[media.media_id_string])
+
+    def publish_media_post(
+        self,
+        text: str,
+        image_path: Path | None = None,
+        *,
+        alt_text: str = "",
+    ) -> None:  # pragma: no cover - network integration
+        try:
+            import tweepy
+        except ImportError as exc:
+            raise RuntimeError("X publishing requires the 'tweepy' package.") from exc
+
+        auth = tweepy.OAuth1UserHandler(
+            self.api_key,
+            self.api_secret,
+            self.access_token,
+            self.access_token_secret,
+        )
+        api_v1 = tweepy.API(auth)
+        client = tweepy.Client(
+            consumer_key=self.api_key,
+            consumer_secret=self.api_secret,
+            access_token=self.access_token,
+            access_token_secret=self.access_token_secret,
+        )
+        if image_path is None:
+            client.create_tweet(text=text)
+            return
+        media = api_v1.media_upload(filename=str(image_path))
+        client.create_tweet(text=text, media_ids=[media.media_id_string])
 
 
 def publishers_from_env() -> List[Publisher]:

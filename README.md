@@ -12,6 +12,8 @@ The app polls the MLB Stats API across a rolling UTC schedule window, detects co
 - Dedupes challenges across polling cycles with a local state file
 - Prefers official MLB clip discovery for each challenge before falling back to a rendered card
 - Tracks home-plate umpires and season-to-date challenge upheld rates
+- Publishes weekly umpire leaderboard posts with a full standings table image
+- Can crown a season-ending ABS umpire champion once the regular season is over
 - Renders a standalone challenge graphic when no usable official clip is available yet
 - Deletes posted image artifacts automatically unless you opt into keeping them
 - Posts challenge text + image to:
@@ -68,6 +70,9 @@ Suggested Railway setup:
 - `ABS_CLIP_WAIT_SECONDS`: how long to keep retrying official MLB clip lookup during live/in-progress game flow before falling back to the rendered graphic, default `900`
 - `ABS_RAW_CLIP_WAIT_SECONDS`: when only `mlb-cuts` is available, how long to keep waiting for a preferred raw `bdata` clip before posting the highlight instead, default `180`
 - `ABS_FINAL_CLIP_WAIT_SECONDS`: how long to keep retrying official MLB clip lookup after the game has reached a terminal state before falling back to the rendered graphic, default `2700`
+- `ABS_LOCAL_TIMEZONE`: local timezone used for weekly leaderboard timing, default `America/New_York`
+- `ABS_WEEKLY_SUMMARY_HOUR_LOCAL`: local-hour trigger for the weekly leaderboard snapshot, default `9`
+- `ABS_REGULAR_SEASON_LOOKAHEAD_DAYS`: future regular-season schedule window used to decide when to crown the season champion, default `120`
 - `ABS_DISCORD_WEBHOOK_URL`: Discord webhook target
 - `ABS_BLUESKY_HANDLE`: BlueSky handle
 - `ABS_BLUESKY_APP_PASSWORD`: BlueSky app password
@@ -84,6 +89,7 @@ Suggested Railway setup:
 - Official MLB challenge clips are discovered from the game content feed, with `PlayId`-based Fastball search used as an identity hint to keep same-game challenge matches separated.
 - Clip preference is tiered: the bot posts `bdata-producedclips` immediately, waits briefly for `bdata` when only `mlb-cuts` is available, keeps checking longer for any official clip while the game is live, extends that wait window after the game ends, then finally falls back to a rendered graphic if no usable clip appears in time.
 - The displayed umpire rate is a challenge-specific upheld rate, not an all-pitches accuracy estimate.
+- Weekly umpire leaderboard posts are generated from the bot's season-to-date HP umpire challenge ledger and are scheduled in the configured local timezone.
 - The renderer writes PNG when Pillow is installed. If Pillow is unavailable, it falls back to SVG.
 - By default, service-mode artifacts are deleted after successful posting. Sample/manual runs still keep their rendered outputs.
 - A `Procfile` and `railway_start.py` launcher are included so Railway can start the service even if the repo contents end up one folder deeper than expected during deployment.

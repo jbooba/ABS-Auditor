@@ -7,9 +7,18 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Set
+from zoneinfo import ZoneInfo
 
 from .challenges import extract_abs_challenges, format_post_text
 from .clips import ClipMedia, ClipLookupResult, lookup_abs_clip_options
+from .leaderboard import (
+    UmpireLeaderboard,
+    build_season_champion_leaderboard,
+    build_weekly_leaderboard,
+    format_leaderboard_alt_text,
+    format_leaderboard_post_text,
+    render_umpire_leaderboard,
+)
 from .mlb import MlbStatsApiClient
 from .publishers import Publisher
 from .render import render_challenge_card
@@ -35,6 +44,9 @@ class AbsBotService:
         clip_wait_seconds: int = 900,
         raw_clip_wait_seconds: int = 180,
         final_clip_wait_seconds: int = 2700,
+        local_timezone: str = "America/New_York",
+        weekly_summary_hour_local: int = 9,
+        regular_season_lookahead_days: int = 120,
     ) -> None:
         self.client = client
         self.publishers = publishers
@@ -49,6 +61,10 @@ class AbsBotService:
         self.clip_wait_seconds = clip_wait_seconds
         self.raw_clip_wait_seconds = raw_clip_wait_seconds
         self.final_clip_wait_seconds = final_clip_wait_seconds
+        self.local_tz = ZoneInfo(local_timezone)
+        self.local_timezone = local_timezone
+        self.weekly_summary_hour_local = weekly_summary_hour_local
+        self.regular_season_lookahead_days = regular_season_lookahead_days
         self.stop_event = threading.Event()
         self.state_lock = threading.Lock()
         self.last_error: str | None = None
@@ -71,6 +87,7 @@ class AbsBotService:
             self.publisher_delivery,
             self.pending_clip_lookups,
             self.seen_clip_urls,
+            self.seen_summary_ids,
         ) = self._load_state()
         self.closed_game_pks: set[int] = set()
 
@@ -210,6 +227,8 @@ class AbsBotService:
                 else:
                     self.closed_game_pks.add(game_pk)
 
+        new_posts += self._maybe_publish_summaries(now=now)
+
         sleep_seconds, mode, wake_reason, next_game_at = self._next_sleep_plan(
             now=now,
             active_games=active_games,
@@ -243,6 +262,8 @@ class AbsBotService:
                 "clip_wait_seconds": self.clip_wait_seconds,
                 "raw_clip_wait_seconds": self.raw_clip_wait_seconds,
                 "final_clip_wait_seconds": self.final_clip_wait_seconds,
+                "local_timezone": self.local_timezone,
+                "weekly_summary_hour_local": self.weekly_summary_hour_local,
                 "games_checked_last_cycle": self.last_games_checked,
                 "feeds_checked_last_cycle": self.last_feeds_checked,
                 "active_games_last_cycle": self.last_active_games,
@@ -256,6 +277,7 @@ class AbsBotService:
                 "pending_publisher_deliveries": len(self.publisher_delivery),
                 "pending_clip_lookups": len(self.pending_clip_lookups),
                 "seen_clip_urls": len(self.seen_clip_urls),
+                "seen_summary_ids": len(self.seen_summary_ids),
                 "total_posts": self.total_posts,
                 "recent_posts": list(self.recent_posts),
                 "recent_failures": list(self.recent_failures),
@@ -409,6 +431,154 @@ class AbsBotService:
         delivered = self.publisher_delivery.get(challenge_id, set())
         return all(publisher.delivery_key in delivered for publisher in self.publishers)
 
+    def _maybe_publish_summaries(self, *, now: datetime) -> int:
+        published = 0
+        published += self._maybe_publish_weekly_leaderboard(now=now)
+        published += self._maybe_publish_season_champion(now=now)
+        return published
+
+    def _maybe_publish_weekly_leaderboard(self, *, now: datetime) -> int:
+        local_now = now.astimezone(self.local_tz)
+        current_week_start = local_now.date() - timedelta(days=local_now.weekday())
+        due_at = datetime.combine(
+            current_week_start,
+            datetime.min.time(),
+            tzinfo=self.local_tz,
+        ) + timedelta(hours=self.weekly_summary_hour_local)
+        if local_now < due_at:
+            return 0
+        week_end = current_week_start - timedelta(days=1)
+        week_start = week_end - timedelta(days=6)
+        leaderboard_id = f"leaderboard:weekly:{week_end.isoformat()}"
+        if leaderboard_id in self.seen_summary_ids:
+            return 0
+        if not self._regular_season_is_active_or_recent(now):
+            return 0
+        leaderboard = build_weekly_leaderboard(
+            umpire_stats=self._umpire_stats_snapshot(),
+            week_start=week_start,
+            week_end=week_end,
+        )
+        return self._publish_leaderboard(leaderboard)
+
+    def _maybe_publish_season_champion(self, *, now: datetime) -> int:
+        local_now = now.astimezone(self.local_tz)
+        if local_now.month < 9:
+            return 0
+        leaderboard_id = f"leaderboard:season:{local_now.year}"
+        if leaderboard_id in self.seen_summary_ids:
+            return 0
+        if not self._regular_season_has_ended(now):
+            return 0
+
+        leaderboard = build_season_champion_leaderboard(
+            umpire_stats=self._umpire_stats_snapshot(),
+            season_year=local_now.year,
+        )
+        return self._publish_leaderboard(leaderboard)
+
+    def _publish_leaderboard(self, leaderboard: UmpireLeaderboard) -> int:
+        if not leaderboard.standings:
+            return 0
+        if leaderboard.leaderboard_id in self.seen_summary_ids:
+            return 0
+
+        artifact_path = render_umpire_leaderboard(leaderboard, self.output_dir)
+        text = format_leaderboard_post_text(leaderboard)
+        alt_text = format_leaderboard_alt_text(leaderboard)
+        delivered_publishers = self.publisher_delivery.get(leaderboard.leaderboard_id, set())
+        publisher_failures: list[str] = []
+
+        for publisher in self.publishers:
+            if publisher.delivery_key in delivered_publishers:
+                continue
+            try:
+                publisher.publish_media_post(text, artifact_path, alt_text=alt_text)
+            except Exception as exc:
+                publisher_failures.append(f"{publisher.delivery_key}: {exc}")
+                continue
+            self._mark_publisher_delivered(leaderboard.leaderboard_id, publisher.delivery_key)
+            delivered_publishers = self.publisher_delivery.get(leaderboard.leaderboard_id, set())
+
+        if publisher_failures:
+            self._record_summary_failures(leaderboard, publisher_failures)
+
+        artifact_retained = (self.keep_artifacts or not self.publishers) and artifact_path is not None
+        completed_this_cycle = self._publishers_complete(leaderboard.leaderboard_id)
+        if completed_this_cycle:
+            self._record_summary_post(
+                leaderboard=leaderboard,
+                artifact_path=artifact_path if artifact_retained else None,
+                text=text,
+                artifact_retained=artifact_retained,
+            )
+        if artifact_path is not None and not artifact_retained:
+            artifact_path.unlink(missing_ok=True)
+        return 1 if completed_this_cycle else 0
+
+    def _record_summary_post(
+        self,
+        *,
+        leaderboard: UmpireLeaderboard,
+        artifact_path: Path | None,
+        text: str,
+        artifact_retained: bool,
+    ) -> None:
+        with self.state_lock:
+            self.seen_summary_ids.add(leaderboard.leaderboard_id)
+            self.publisher_delivery.pop(leaderboard.leaderboard_id, None)
+            self.recent_posts.appendleft(
+                {
+                    "summary_id": leaderboard.leaderboard_id,
+                    "summary_kind": leaderboard.kind,
+                    "title": leaderboard.title,
+                    "artifact_path": str(artifact_path) if artifact_path else None,
+                    "artifact_retained": artifact_retained,
+                    "media_source": "leaderboard",
+                    "posted_at": _utc_now_iso(),
+                    "text": text,
+                }
+            )
+            self._save_state()
+
+    def _record_summary_failures(self, leaderboard: UmpireLeaderboard, failures: list[str]) -> None:
+        with self.state_lock:
+            message = "; ".join(failures)
+            self.last_error = message
+            self.recent_failures.appendleft(
+                {
+                    "summary_id": leaderboard.leaderboard_id,
+                    "summary_kind": leaderboard.kind,
+                    "title": leaderboard.title,
+                    "failures": failures,
+                    "failed_at": _utc_now_iso(),
+                }
+            )
+
+    def _regular_season_is_active_or_recent(self, now: datetime) -> bool:
+        recent_dates = [
+            (now.astimezone(timezone.utc).date() - timedelta(days=offset)).isoformat()
+            for offset in range(7, -1, -1)
+        ]
+        future_dates = self.client.lookahead_dates(now, 14)
+        games = self.client.schedule_for_dates(recent_dates + future_dates)
+        return any(self.client.game_type(game) == "R" for game in games)
+
+    def _regular_season_has_ended(self, now: datetime) -> bool:
+        recent_dates = [
+            (now.astimezone(timezone.utc).date() - timedelta(days=offset)).isoformat()
+            for offset in range(30, -1, -1)
+        ]
+        future_dates = self.client.lookahead_dates(now, self.regular_season_lookahead_days)
+        recent_games = self.client.schedule_for_dates(recent_dates)
+        future_games = self.client.schedule_for_dates(future_dates)
+        had_recent_regular_games = any(self.client.game_type(game) == "R" for game in recent_games)
+        has_future_or_active_regular_games = any(
+            self.client.game_type(game) == "R" and not self.client.is_terminal_game(game)
+            for game in future_games
+        )
+        return had_recent_regular_games and not has_future_or_active_regular_games
+
     def _load_state(
         self,
     ) -> tuple[
@@ -417,17 +587,18 @@ class AbsBotService:
         dict[str, Set[str]],
         dict[str, Dict[str, Any]],
         dict[str, str],
+        set[str],
     ]:
         if not self.state_file.exists():
-            return set(), {}, {}, {}, {}
+            return set(), {}, {}, {}, {}, set()
         try:
             payload = json.loads(self.state_file.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
-            return set(), {}, {}, {}, {}
+            return set(), {}, {}, {}, {}, set()
         if isinstance(payload, list):
-            return {str(item) for item in payload}, {}, {}, {}, {}
+            return {str(item) for item in payload}, {}, {}, {}, {}, set()
         if not isinstance(payload, dict):
-            return set(), {}, {}, {}, {}
+            return set(), {}, {}, {}, {}, set()
 
         payload_version = int(payload.get("state_version", 0) or 0)
         seen_ids: set[str] = set()
@@ -476,7 +647,11 @@ class AbsBotService:
                 if not clip_url or not challenge_id:
                     continue
                 seen_clip_urls[str(clip_url)] = str(challenge_id)
-        return seen_ids, umpire_stats, publisher_delivery, pending_clip_lookups, seen_clip_urls
+        seen_summary_ids: set[str] = set()
+        seen_summary_payload = payload.get("seen_summary_ids", [])
+        if payload_version == STATE_VERSION and isinstance(seen_summary_payload, list):
+            seen_summary_ids = {str(item) for item in seen_summary_payload if item is not None}
+        return seen_ids, umpire_stats, publisher_delivery, pending_clip_lookups, seen_clip_urls, seen_summary_ids
 
     def _save_state(self) -> None:
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
@@ -492,6 +667,7 @@ class AbsBotService:
                     },
                     "pending_clip_lookups": self.pending_clip_lookups,
                     "seen_clip_urls": self.seen_clip_urls,
+                    "seen_summary_ids": sorted(self.seen_summary_ids),
                 },
                 indent=2,
             ),
@@ -504,6 +680,13 @@ class AbsBotService:
                 clip_url
                 for clip_url, recorded_challenge_id in self.seen_clip_urls.items()
                 if recorded_challenge_id != challenge_id
+            }
+
+    def _umpire_stats_snapshot(self) -> dict[str, Dict[str, Any]]:
+        with self.state_lock:
+            return {
+                key: dict(value)
+                for key, value in self.umpire_stats.items()
             }
 
     def _challenge_with_umpire_stats(self, challenge: Any) -> Any:

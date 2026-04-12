@@ -32,6 +32,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--clip-wait-seconds", type=int, default=int(os.getenv("ABS_CLIP_WAIT_SECONDS", "900")))
     parser.add_argument("--raw-clip-wait-seconds", type=int, default=int(os.getenv("ABS_RAW_CLIP_WAIT_SECONDS", "180")))
     parser.add_argument("--final-clip-wait-seconds", type=int, default=int(os.getenv("ABS_FINAL_CLIP_WAIT_SECONDS", "2700")))
+    parser.add_argument("--local-timezone", type=str, default=os.getenv("ABS_LOCAL_TIMEZONE", "America/New_York"))
+    parser.add_argument("--weekly-summary-hour-local", type=int, default=int(os.getenv("ABS_WEEKLY_SUMMARY_HOUR_LOCAL", "9")))
+    parser.add_argument("--regular-season-lookahead-days", type=int, default=int(os.getenv("ABS_REGULAR_SEASON_LOOKAHEAD_DAYS", "120")))
     parser.add_argument("--port", type=int, default=int(os.getenv("PORT", "8080")))
     parser.add_argument("--once", action="store_true", help="Run a single pass and exit")
     return parser.parse_args()
@@ -59,6 +62,9 @@ def main() -> int:
         clip_wait_seconds=args.clip_wait_seconds,
         raw_clip_wait_seconds=args.raw_clip_wait_seconds,
         final_clip_wait_seconds=args.final_clip_wait_seconds,
+        local_timezone=args.local_timezone,
+        weekly_summary_hour_local=args.weekly_summary_hour_local,
+        regular_season_lookahead_days=args.regular_season_lookahead_days,
     )
 
     if args.once:

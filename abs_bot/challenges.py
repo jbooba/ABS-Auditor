@@ -243,6 +243,7 @@ def _format_clip_social_post(challenge: AbsChallenge, *, limit: int) -> str:
         f"ABS {challenge.outcome_label.lower()} in {_matchup_with_tags(challenge.teams)} ({challenge.inning_label}).",
         _clip_challenge_line(challenge),
         _clip_call_transition_text(challenge),
+        _clip_umpire_line(challenge),
     ]
 
     result_line = _bluesky_result_line(challenge)
@@ -328,6 +329,14 @@ def _clip_call_transition_text(challenge: AbsChallenge) -> str:
     if challenge.final_call == "Called Strike":
         return "Called strike confirmed."
     return f"{challenge.final_call} confirmed."
+
+
+def _clip_umpire_line(challenge: AbsChallenge) -> str:
+    umpire_name = challenge.home_plate_umpire_name or "Unknown"
+    if challenge.umpire_challenge_summary:
+        summary = challenge.umpire_challenge_summary.removeprefix("Challenges upheld: ")
+        return f"HP: {umpire_name} | Upheld {summary}."
+    return f"HP: {umpire_name}."
 
 
 def _challenged_call_phrase(challenge: AbsChallenge) -> str:
