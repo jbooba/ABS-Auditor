@@ -115,7 +115,7 @@ class BlueSkyPublisher(Publisher):
             except Exception:
                 thumb_blob = None
             external_kwargs = {
-                "uri": clip.page_url or clip.direct_url,
+                "uri": clip.social_url or clip.page_url or clip.direct_url,
                 "title": _truncate_embed_text(clip.title, 100),
                 "description": _truncate_embed_text(clip.description or clip.title, 280),
             }
@@ -191,7 +191,12 @@ class XPublisher(Publisher):
             access_token_secret=self.access_token_secret,
         )
         if clip is not None:
-            client.create_tweet(text=format_x_clip_post_text(challenge, clip.page_url or clip.direct_url))
+            client.create_tweet(
+                text=format_x_clip_post_text(
+                    challenge,
+                    clip.social_url or clip.page_url or clip.direct_url,
+                )
+            )
             return
 
         if image_path is None:

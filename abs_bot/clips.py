@@ -28,6 +28,7 @@ class ClipMedia:
     clip_kind: str
     playback_name: str
     page_url: str
+    social_url: str
     title: str
     description: str
     thumbnail_url: str
@@ -74,6 +75,7 @@ def lookup_abs_clip_options(challenge: AbsChallenge) -> ClipLookupResult:
         title = str(item.get("headline") or item.get("title") or "")
         description = str(item.get("blurb") or item.get("description") or "")
         page_url = _item_page_url(item, challenge.pitch.play_id)
+        social_url = _preferred_social_url(page_url)
         thumbnail_url = _item_thumbnail_url(item)
         for playback in item.get("playbacks") or []:
             clip_url = str(playback.get("url") or "")
@@ -88,6 +90,7 @@ def lookup_abs_clip_options(challenge: AbsChallenge) -> ClipLookupResult:
                     clip_kind="raw" if host in RAW_CLIP_HOSTS else "highlight",
                     playback_name=playback_name,
                     page_url=page_url,
+                    social_url=social_url,
                     title=title,
                     description=description,
                     thumbnail_url=thumbnail_url,
@@ -315,6 +318,33 @@ def _item_thumbnail_url(item: Dict[str, Any]) -> str:
             best_src = src
             best_width = width
     return best_src
+
+
+@lru_cache(maxsize=2048)
+def _preferred_social_url(page_url: str) -> str:
+    if not page_url:
+        return ""
+    try:
+        request = Request(
+            page_url,
+            headers={
+                "User-Agent": USER_AGENT,
+                "Accept": "text/html,application/xhtml+xml",
+            },
+        )
+        with urlopen(request, timeout=20) as response:
+            html = response.read().decode("utf-8", errors="ignore")
+    except Exception:
+        return page_url
+
+    for pattern in (
+        r'<meta\s+name="twitter:player"\s+content="([^"]+)"',
+        r'"embedUrl":"(https://streamable\.com/m/[^"]+)"',
+    ):
+        match = re.search(pattern, html, flags=re.IGNORECASE)
+        if match:
+            return match.group(1).replace("&amp;", "&")
+    return page_url
 
 
 def _token_set(text: str) -> set[str]:
