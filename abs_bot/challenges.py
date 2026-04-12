@@ -242,11 +242,7 @@ def _format_clip_social_post(challenge: AbsChallenge, *, limit: int) -> str:
     lines = [
         f"ABS {challenge.outcome_label.lower()} in {_matchup_with_tags(challenge.teams)} ({challenge.inning_label}).",
         _clip_challenge_line(challenge),
-        (
-            f"{_clip_call_transition_text(challenge)} "
-            f"Count {challenge.pitch.count_display}, {challenge.outs_display}, {challenge.runners_display}."
-        ),
-        f"Score: {challenge.score_display}.",
+        _clip_call_transition_text(challenge),
     ]
 
     result_line = _bluesky_result_line(challenge)
@@ -312,9 +308,16 @@ def _bluesky_result_line(challenge: AbsChallenge) -> str:
 
 
 def _clip_challenge_line(challenge: AbsChallenge) -> str:
+    challenged_call = _challenged_call_phrase(challenge)
     if challenge.challenger_name == challenge.batter_name:
-        return f"{challenge.challenger_name} challenged."
-    return f"{challenge.challenger_name} challenged {challenge.batter_name}'s pitch."
+        return (
+            f"{challenge.challenger_name} challenged the {challenged_call} "
+            f"against {challenge.pitcher_name}."
+        )
+    return (
+        f"{challenge.challenger_name} challenged the {challenged_call} "
+        f"on {_possessive_name(challenge.pitcher_name)} pitch to {challenge.batter_name}."
+    )
 
 
 def _clip_call_transition_text(challenge: AbsChallenge) -> str:
@@ -325,6 +328,25 @@ def _clip_call_transition_text(challenge: AbsChallenge) -> str:
     if challenge.final_call == "Called Strike":
         return "Called strike confirmed."
     return f"{challenge.final_call} confirmed."
+
+
+def _challenged_call_phrase(challenge: AbsChallenge) -> str:
+    if challenge.original_call == "Called Strike":
+        return "called strike"
+    if challenge.original_call == "Ball":
+        return "ball call"
+    lowered = challenge.original_call.strip().lower()
+    if not lowered:
+        return "call"
+    if lowered.endswith("call"):
+        return lowered
+    return f"{lowered} call"
+
+
+def _possessive_name(name: str) -> str:
+    if not name:
+        return "the"
+    return f"{name}'" if name.endswith("s") else f"{name}'s"
 
 
 def _fit_bluesky_text(lines: list[str], limit: int = 300) -> str:
