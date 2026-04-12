@@ -70,6 +70,7 @@ class AbsBotService:
             self.umpire_stats,
             self.publisher_delivery,
             self.pending_clip_lookups,
+            self.seen_clip_urls,
         ) = self._load_state()
         self.closed_game_pks: set[int] = set()
 
@@ -141,7 +142,10 @@ class AbsBotService:
                 if challenge.challenge_id in self.seen_challenge_ids:
                     continue
                 challenge = self._challenge_with_umpire_stats(challenge)
-                clip_options = lookup_abs_clip_options(challenge)
+                clip_options = lookup_abs_clip_options(
+                    challenge,
+                    excluded_direct_urls=self._seen_clip_urls_for_other_challenges(challenge.challenge_id),
+                )
                 clip = self._choose_clip_for_publish(challenge, clip_options)
                 if clip is None:
                     if self._should_wait_for_clip(
@@ -251,6 +255,7 @@ class AbsBotService:
                 "tracked_umpires": len(self.umpire_stats),
                 "pending_publisher_deliveries": len(self.publisher_delivery),
                 "pending_clip_lookups": len(self.pending_clip_lookups),
+                "seen_clip_urls": len(self.seen_clip_urls),
                 "total_posts": self.total_posts,
                 "recent_posts": list(self.recent_posts),
                 "recent_failures": list(self.recent_failures),
@@ -270,6 +275,8 @@ class AbsBotService:
             self.seen_challenge_ids.add(challenge_id)
             self.publisher_delivery.pop(challenge_id, None)
             self.pending_clip_lookups.pop(challenge_id, None)
+            if clip is not None and clip.direct_url:
+                self.seen_clip_urls[clip.direct_url] = challenge_id
             self._update_umpire_stats(challenge)
             self.recent_posts.appendleft(
                 {
@@ -402,17 +409,25 @@ class AbsBotService:
         delivered = self.publisher_delivery.get(challenge_id, set())
         return all(publisher.delivery_key in delivered for publisher in self.publishers)
 
-    def _load_state(self) -> tuple[set[str], dict[str, Dict[str, Any]], dict[str, Set[str]], dict[str, Dict[str, Any]]]:
+    def _load_state(
+        self,
+    ) -> tuple[
+        set[str],
+        dict[str, Dict[str, Any]],
+        dict[str, Set[str]],
+        dict[str, Dict[str, Any]],
+        dict[str, str],
+    ]:
         if not self.state_file.exists():
-            return set(), {}, {}, {}
+            return set(), {}, {}, {}, {}
         try:
             payload = json.loads(self.state_file.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
-            return set(), {}, {}, {}
+            return set(), {}, {}, {}, {}
         if isinstance(payload, list):
-            return {str(item) for item in payload}, {}, {}, {}
+            return {str(item) for item in payload}, {}, {}, {}, {}
         if not isinstance(payload, dict):
-            return set(), {}, {}, {}
+            return set(), {}, {}, {}, {}
 
         payload_version = int(payload.get("state_version", 0) or 0)
         seen_ids: set[str] = set()
@@ -454,7 +469,14 @@ class AbsBotService:
                     "available_clip_kind": str(value.get("available_clip_kind", "")),
                     "available_clip_host": str(value.get("available_clip_host", "")),
                 }
-        return seen_ids, umpire_stats, publisher_delivery, pending_clip_lookups
+        seen_clip_urls: dict[str, str] = {}
+        seen_clip_payload = payload.get("seen_clip_urls", {})
+        if payload_version == STATE_VERSION and isinstance(seen_clip_payload, dict):
+            for clip_url, challenge_id in seen_clip_payload.items():
+                if not clip_url or not challenge_id:
+                    continue
+                seen_clip_urls[str(clip_url)] = str(challenge_id)
+        return seen_ids, umpire_stats, publisher_delivery, pending_clip_lookups, seen_clip_urls
 
     def _save_state(self) -> None:
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
@@ -469,11 +491,20 @@ class AbsBotService:
                         for key, value in self.publisher_delivery.items()
                     },
                     "pending_clip_lookups": self.pending_clip_lookups,
+                    "seen_clip_urls": self.seen_clip_urls,
                 },
                 indent=2,
             ),
             encoding="utf-8",
         )
+
+    def _seen_clip_urls_for_other_challenges(self, challenge_id: str) -> set[str]:
+        with self.state_lock:
+            return {
+                clip_url
+                for clip_url, recorded_challenge_id in self.seen_clip_urls.items()
+                if recorded_challenge_id != challenge_id
+            }
 
     def _challenge_with_umpire_stats(self, challenge: Any) -> Any:
         key = self._umpire_state_key(challenge)

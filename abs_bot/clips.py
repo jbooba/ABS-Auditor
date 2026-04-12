@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import re
+import time
 import unicodedata
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Any, Dict, Iterable, List, Optional
 from urllib.parse import quote_plus, urlencode, urlparse
@@ -19,6 +21,8 @@ ALLOWED_CLIP_HOSTS = {
     "milb-cuts-diamond.mlb.com",
 }
 RAW_CLIP_HOSTS = {"bdata-producedclips.mlb.com"}
+GAME_CONTENT_CACHE_TTL_SECONDS = 30.0
+_GAME_CONTENT_CACHE: dict[int, tuple[float, tuple[dict[str, Any], ...]]] = {}
 
 
 @dataclass(frozen=True)
@@ -50,10 +54,19 @@ def lookup_best_abs_clip(challenge: AbsChallenge) -> Optional[ClipMedia]:
     return lookup_abs_clip_options(challenge).best_available
 
 
-def lookup_abs_clip_options(challenge: AbsChallenge) -> ClipLookupResult:
+def lookup_abs_clip_options(
+    challenge: AbsChallenge,
+    *,
+    excluded_direct_urls: Iterable[str] | None = None,
+) -> ClipLookupResult:
     if not challenge.pitch.play_id:
         return ClipLookupResult(raw_clip=None, highlight_clip=None)
 
+    excluded_urls = {
+        str(url)
+        for url in (excluded_direct_urls or ())
+        if url
+    }
     exact_media = _fetch_fastball_play_media(challenge.pitch.play_id)
     exact_media_text = _normalize_text(
         " ".join(
@@ -82,6 +95,8 @@ def lookup_abs_clip_options(challenge: AbsChallenge) -> ClipLookupResult:
             host = _clip_host_from_url(clip_url)
             if host not in ALLOWED_CLIP_HOSTS:
                 continue
+            if clip_url in excluded_urls:
+                continue
             playback_name = str(playback.get("name") or "")
             candidates.append(
                 ClipMedia(
@@ -108,12 +123,20 @@ def lookup_abs_clip_options(challenge: AbsChallenge) -> ClipLookupResult:
     )
 
 
-@lru_cache(maxsize=512)
 def _fetch_game_content_items(game_pk: int) -> tuple[dict[str, Any], ...]:
+    cached = _GAME_CONTENT_CACHE.get(game_pk)
+    now = time.monotonic()
+    if cached is not None:
+        fetched_at, items = cached
+        if (now - fetched_at) < GAME_CONTENT_CACHE_TTL_SECONDS:
+            return items
+
     url = f"https://statsapi.mlb.com/api/v1/game/{game_pk}/content?language=en"
     data = _fetch_json(url)
     items = ((data.get("highlights") or {}).get("highlights") or {}).get("items") or []
-    return tuple(item for item in items if isinstance(item, dict))
+    normalized_items = tuple(item for item in items if isinstance(item, dict))
+    _GAME_CONTENT_CACHE[game_pk] = (now, normalized_items)
+    return normalized_items
 
 
 @lru_cache(maxsize=2048)
@@ -193,6 +216,7 @@ def _score_content_item(
     }
     keyword_text = " ".join(part for part in keyword_values if part)
     search_text = " ".join(part for part in [combined_text, slug_text, keyword_text] if part)
+    review_marker = _has_review_marker(search_text)
 
     player_signals = 0
     score = 0
@@ -200,6 +224,10 @@ def _score_content_item(
         score += 120
     if "challenge" in search_text or "challenged" in search_text:
         score += 70
+    if "capture review" in search_text:
+        score += 90
+    if "review" in search_text:
+        score += 20
     if challenge.is_overturned and "overturned" in search_text:
         score += 60
     if (not challenge.is_overturned) and ("confirmed" in search_text or "stands" in search_text):
@@ -242,6 +270,25 @@ def _score_content_item(
     if any(game_pk_text in text for text in keyword_values):
         score += 50
 
+    item_date = _parse_mlb_datetime(item.get("date"))
+    play_end_time = _parse_mlb_datetime(challenge.play_end_time)
+    if item_date is not None and play_end_time is not None:
+        published_after_play_seconds = (item_date - play_end_time).total_seconds()
+        if published_after_play_seconds < -120:
+            return 0
+        if published_after_play_seconds <= 120:
+            score += 120
+        elif published_after_play_seconds <= 300:
+            score += 90
+        elif published_after_play_seconds <= 900:
+            score += 70
+        elif published_after_play_seconds <= 2700:
+            score += 40
+        elif published_after_play_seconds <= 10800:
+            score += 10
+        else:
+            score -= 20
+
     clip_hosts = {
         _clip_host_from_url(str(playback.get("url") or ""))
         for playback in item.get("playbacks") or []
@@ -249,10 +296,10 @@ def _score_content_item(
     if any(host in ALLOWED_CLIP_HOSTS for host in clip_hosts):
         score += 25
 
-    has_generic_review_title = (
-        ("abs" in search_text or "challenge" in search_text or "capture review" in search_text)
-        and player_signals == 0
-    )
+    if not review_marker:
+        return 0
+
+    has_generic_review_title = review_marker and player_signals == 0
     if has_generic_review_title:
         return 0
 
@@ -371,6 +418,31 @@ def _normalize_text(text: str) -> str:
     ascii_text = normalized.encode("ascii", "ignore").decode("ascii")
     cleaned = re.sub(r"[^a-z0-9]+", " ", ascii_text.lower())
     return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _has_review_marker(text: str) -> bool:
+    markers = (
+        "abs",
+        "challenge",
+        "challenged",
+        "capture review",
+        "review",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _parse_mlb_datetime(value: Any) -> datetime | None:
+    if not value:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(text).astimezone(timezone.utc)
+    except ValueError:
+        return None
 
 
 def _fetch_json(url: str) -> Dict[str, Any]:
