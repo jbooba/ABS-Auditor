@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 from collections import deque
 from dataclasses import replace
@@ -25,6 +26,7 @@ from .render import render_challenge_card
 
 
 STATE_VERSION = 8
+logger = logging.getLogger(__name__)
 
 
 class AbsBotService:
@@ -92,11 +94,13 @@ class AbsBotService:
         self.closed_game_pks: set[int] = set()
 
     def run_forever(self) -> None:
+        logger.info("Entering run_forever loop")
         while not self.stop_event.is_set():
             sleep_seconds = float(self.poll_seconds)
             try:
                 sleep_seconds = self.poll_once()
             except Exception as exc:  # pragma: no cover - safety net
+                logger.exception("Unhandled exception in poll loop: %s", exc)
                 with self.state_lock:
                     self.last_error = str(exc)
                     self.last_poll_finished_at = _utc_now_iso()
@@ -104,10 +108,12 @@ class AbsBotService:
                     self.next_wake_reason = "Retry after error"
                     self.next_wake_at = _utc_after_seconds_iso(self.poll_seconds)
                 sleep_seconds = float(self.poll_seconds)
+            logger.info("Sleeping for %.1fs before next cycle", sleep_seconds)
             self.stop_event.wait(max(1.0, sleep_seconds))
 
     def poll_once(self) -> float:
         now = datetime.now(timezone.utc)
+        logger.info("Starting poll cycle at %s", now.isoformat())
         with self.state_lock:
             self.last_poll_started_at = now.isoformat()
             self.last_error = None
@@ -118,6 +124,7 @@ class AbsBotService:
             for game in self.client.schedule_for_dates(dates)
             if self.client.should_track_game(game)
         ]
+        logger.info("Schedule window %s yielded %s tracked game(s)", dates, len(games))
         current_game_pks = {
             int(game.get("gamePk", 0))
             for game in games
@@ -135,6 +142,13 @@ class AbsBotService:
             for game in upcoming_games
             if self.client.is_within_activation_window(game, now, self.activation_lead)
         ]
+        logger.info(
+            "Cycle state: active=%s imminent=%s upcoming=%s closed_terminal=%s",
+            len(active_games),
+            len(imminent_games),
+            len(upcoming_games),
+            len(self.closed_game_pks),
+        )
 
         games_to_fetch: List[Dict[str, Any]] = []
         for game in games:
@@ -147,16 +161,26 @@ class AbsBotService:
                 continue
             if self.client.is_terminal_game(game) and game_pk not in self.closed_game_pks:
                 games_to_fetch.append(game)
+        logger.info("Fetching live feeds for %s game(s)", len(games_to_fetch))
 
         new_posts = 0
         for game in games_to_fetch:
             game_pk = int(game.get("gamePk", 0))
             if not game_pk:
                 continue
+            logger.info(
+                "Fetching feed for game %s (%s, %s)",
+                game_pk,
+                self.client.matchup_label(game),
+                self.client.detailed_state(game),
+            )
             feed = self.client.fetch_live_game_feed(game_pk)
             game_has_pending_delivery = False
-            for challenge in extract_abs_challenges(feed):
+            challenges = extract_abs_challenges(feed)
+            logger.info("Game %s produced %s ABS challenge candidate(s)", game_pk, len(challenges))
+            for challenge in challenges:
                 if challenge.challenge_id in self.seen_challenge_ids:
+                    logger.debug("Skipping seen challenge %s", challenge.challenge_id)
                     continue
                 challenge = self._challenge_with_umpire_stats(challenge)
                 clip_options = lookup_abs_clip_options(
@@ -164,11 +188,25 @@ class AbsBotService:
                     excluded_direct_urls=self._seen_clip_urls_for_other_challenges(challenge.challenge_id),
                 )
                 clip = self._choose_clip_for_publish(challenge, clip_options)
+                logger.info(
+                    "Challenge %s %s %s: raw_clip=%s highlight_clip=%s chosen=%s",
+                    challenge.challenge_id,
+                    challenge.teams.matchup_label,
+                    challenge.inning_label,
+                    clip_options.raw_clip.direct_url if clip_options.raw_clip else None,
+                    clip_options.highlight_clip.direct_url if clip_options.highlight_clip else None,
+                    clip.direct_url if clip else None,
+                )
                 if clip is None:
                     if self._should_wait_for_clip(
                         challenge,
                         game_is_terminal=self.client.is_terminal_game(game),
                     ):
+                        logger.info(
+                            "Waiting on clip for challenge %s (game_terminal=%s)",
+                            challenge.challenge_id,
+                            self.client.is_terminal_game(game),
+                        )
                         self._mark_clip_pending(
                             challenge.challenge_id,
                             available_clip_kind=(
@@ -184,6 +222,7 @@ class AbsBotService:
                         )
                         game_has_pending_delivery = True
                         continue
+                    logger.info("No clip available for challenge %s; falling back to graphic", challenge.challenge_id)
 
                 self._clear_clip_pending(challenge.challenge_id)
                 artifact_path = None if clip else render_challenge_card(challenge, self.output_dir)
@@ -192,13 +231,35 @@ class AbsBotService:
                 publisher_failures: list[str] = []
                 for publisher in self.publishers:
                     if publisher.delivery_key in delivered_publishers:
+                        logger.debug(
+                            "Skipping publisher %s for challenge %s because it is already delivered",
+                            publisher.delivery_key,
+                            challenge.challenge_id,
+                        )
                         continue
                     try:
+                        logger.info(
+                            "Publishing challenge %s via %s using %s",
+                            challenge.challenge_id,
+                            publisher.delivery_key,
+                            "clip" if clip else "graphic",
+                        )
                         publisher.publish(challenge, post_text, artifact_path, clip=clip)
                     except Exception as exc:
+                        logger.exception(
+                            "Publisher %s failed for challenge %s: %s",
+                            publisher.delivery_key,
+                            challenge.challenge_id,
+                            exc,
+                        )
                         publisher_failures.append(f"{publisher.delivery_key}: {exc}")
                         continue
                     self._mark_publisher_delivered(challenge.challenge_id, publisher.delivery_key)
+                    logger.info(
+                        "Publisher %s succeeded for challenge %s",
+                        publisher.delivery_key,
+                        challenge.challenge_id,
+                    )
                     delivered_publishers = self.publisher_delivery.get(challenge.challenge_id, set())
 
                 if publisher_failures:
@@ -207,6 +268,10 @@ class AbsBotService:
                 artifact_retained = (self.keep_artifacts or not self.publishers) and artifact_path is not None
                 completed_this_cycle = self._publishers_complete(challenge.challenge_id)
                 if completed_this_cycle:
+                    logger.info(
+                        "Challenge %s fully delivered; recording and finalizing",
+                        challenge.challenge_id,
+                    )
                     self._record_challenge(
                         challenge.challenge_id,
                         challenge,
@@ -220,11 +285,17 @@ class AbsBotService:
                 if completed_this_cycle:
                     new_posts += 1
                 else:
+                    logger.info(
+                        "Challenge %s still has pending publisher deliveries",
+                        challenge.challenge_id,
+                    )
                     game_has_pending_delivery = True
             if self.client.is_terminal_game(game):
                 if game_has_pending_delivery:
+                    logger.info("Terminal game %s remains open because some deliveries are pending", game_pk)
                     self.closed_game_pks.discard(game_pk)
                 else:
+                    logger.info("Terminal game %s closed for future polling", game_pk)
                     self.closed_game_pks.add(game_pk)
 
         new_posts += self._maybe_publish_summaries(now=now)
@@ -248,6 +319,15 @@ class AbsBotService:
             self.next_game_at = next_game_at
             self.last_poll_finished_at = _utc_now_iso()
             self.total_posts += new_posts
+        logger.info(
+            "Poll cycle complete: games_checked=%s feeds_checked=%s new_posts=%s mode=%s next_wake_at=%s reason=%s",
+            len(games),
+            len(games_to_fetch),
+            new_posts,
+            mode,
+            next_wake_at,
+            wake_reason,
+        )
         return sleep_seconds
 
     def snapshot(self) -> Dict[str, Any]:
@@ -293,6 +373,12 @@ class AbsBotService:
         clip: ClipMedia | None,
         artifact_retained: bool,
     ) -> None:
+        logger.info(
+            "Recording challenge %s (artifact_retained=%s clip=%s)",
+            challenge_id,
+            artifact_retained,
+            clip.direct_url if clip else None,
+        )
         with self.state_lock:
             self.seen_challenge_ids.add(challenge_id)
             self.publisher_delivery.pop(challenge_id, None)
@@ -321,12 +407,14 @@ class AbsBotService:
             self._save_state()
 
     def _mark_publisher_delivered(self, challenge_id: str, publisher_key: str) -> None:
+        logger.debug("Marking publisher %s delivered for %s", publisher_key, challenge_id)
         with self.state_lock:
             delivery = self.publisher_delivery.setdefault(challenge_id, set())
             delivery.add(publisher_key)
             self._save_state()
 
     def _record_failures(self, challenge: Any, failures: list[str]) -> None:
+        logger.warning("Recording challenge failures for %s: %s", challenge.challenge_id, failures)
         with self.state_lock:
             message = "; ".join(failures)
             self.last_error = message
@@ -355,6 +443,12 @@ class AbsBotService:
         available_clip_host: str | None = None,
     ) -> None:
         now_iso = _utc_now_iso()
+        logger.info(
+            "Marking challenge %s as pending clip lookup (kind=%s host=%s)",
+            challenge_id,
+            available_clip_kind,
+            available_clip_host,
+        )
         with self.state_lock:
             existing = self.pending_clip_lookups.get(challenge_id, {})
             self.pending_clip_lookups[challenge_id] = {
@@ -375,6 +469,7 @@ class AbsBotService:
             self._save_state()
 
     def _clear_clip_pending(self, challenge_id: str) -> None:
+        logger.debug("Clearing pending clip lookup for %s", challenge_id)
         with self.state_lock:
             if challenge_id not in self.pending_clip_lookups:
                 return
@@ -387,11 +482,15 @@ class AbsBotService:
         clip_options: ClipLookupResult,
     ) -> ClipMedia | None:
         if clip_options.raw_clip is not None:
+            logger.debug("Selected raw clip for challenge %s", challenge.challenge_id)
             return clip_options.raw_clip
         if clip_options.highlight_clip is None:
+            logger.debug("No clip available yet for challenge %s", challenge.challenge_id)
             return None
         if self._should_wait_for_raw_clip(challenge):
+            logger.info("Holding challenge %s for preferred raw clip", challenge.challenge_id)
             return None
+        logger.info("Falling back to highlight clip for challenge %s", challenge.challenge_id)
         return clip_options.highlight_clip
 
     def _should_wait_for_clip(self, challenge: Any, *, game_is_terminal: bool) -> bool:
@@ -479,13 +578,20 @@ class AbsBotService:
 
     def _publish_leaderboard(self, leaderboard: UmpireLeaderboard) -> int:
         if not leaderboard.standings:
+            logger.info("Skipping leaderboard %s because there are no standings", leaderboard.leaderboard_id)
             return 0
         if leaderboard.leaderboard_id in self.seen_summary_ids:
+            logger.debug("Skipping already-seen leaderboard %s", leaderboard.leaderboard_id)
             return 0
 
         artifact_path = render_umpire_leaderboard(leaderboard, self.output_dir)
         text = format_leaderboard_post_text(leaderboard)
         alt_text = format_leaderboard_alt_text(leaderboard)
+        logger.info(
+            "Publishing leaderboard %s (%s standings)",
+            leaderboard.leaderboard_id,
+            len(leaderboard.standings),
+        )
         delivered_publishers = self.publisher_delivery.get(leaderboard.leaderboard_id, set())
         publisher_failures: list[str] = []
 
@@ -493,11 +599,27 @@ class AbsBotService:
             if publisher.delivery_key in delivered_publishers:
                 continue
             try:
+                logger.info(
+                    "Publishing leaderboard %s via %s",
+                    leaderboard.leaderboard_id,
+                    publisher.delivery_key,
+                )
                 publisher.publish_media_post(text, artifact_path, alt_text=alt_text)
             except Exception as exc:
+                logger.exception(
+                    "Publisher %s failed for leaderboard %s: %s",
+                    publisher.delivery_key,
+                    leaderboard.leaderboard_id,
+                    exc,
+                )
                 publisher_failures.append(f"{publisher.delivery_key}: {exc}")
                 continue
             self._mark_publisher_delivered(leaderboard.leaderboard_id, publisher.delivery_key)
+            logger.info(
+                "Publisher %s succeeded for leaderboard %s",
+                publisher.delivery_key,
+                leaderboard.leaderboard_id,
+            )
             delivered_publishers = self.publisher_delivery.get(leaderboard.leaderboard_id, set())
 
         if publisher_failures:
@@ -506,6 +628,7 @@ class AbsBotService:
         artifact_retained = (self.keep_artifacts or not self.publishers) and artifact_path is not None
         completed_this_cycle = self._publishers_complete(leaderboard.leaderboard_id)
         if completed_this_cycle:
+            logger.info("Leaderboard %s fully delivered", leaderboard.leaderboard_id)
             self._record_summary_post(
                 leaderboard=leaderboard,
                 artifact_path=artifact_path if artifact_retained else None,
@@ -524,6 +647,11 @@ class AbsBotService:
         text: str,
         artifact_retained: bool,
     ) -> None:
+        logger.info(
+            "Recording summary post %s (artifact_retained=%s)",
+            leaderboard.leaderboard_id,
+            artifact_retained,
+        )
         with self.state_lock:
             self.seen_summary_ids.add(leaderboard.leaderboard_id)
             self.publisher_delivery.pop(leaderboard.leaderboard_id, None)
@@ -542,6 +670,7 @@ class AbsBotService:
             self._save_state()
 
     def _record_summary_failures(self, leaderboard: UmpireLeaderboard, failures: list[str]) -> None:
+        logger.warning("Recording summary failures for %s: %s", leaderboard.leaderboard_id, failures)
         with self.state_lock:
             message = "; ".join(failures)
             self.last_error = message

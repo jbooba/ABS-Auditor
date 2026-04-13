@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import io
+import logging
 import mimetypes
 import os
 import tempfile
@@ -25,6 +26,9 @@ from .challenges import (
 )
 from .clips import ClipMedia
 from .models import AbsChallenge
+
+
+logger = logging.getLogger(__name__)
 
 
 class Publisher:
@@ -69,6 +73,7 @@ class DiscordWebhookPublisher(Publisher):
         clip: ClipMedia | None = None,
     ) -> None:
         if clip is not None:
+            logger.info("Discord publishing clip for challenge %s", challenge.challenge_id)
             payload = {"content": f"{text}\n{clip.direct_url}".strip()}
             request = Request(
                 self.webhook_url,
@@ -85,6 +90,7 @@ class DiscordWebhookPublisher(Publisher):
 
         if image_path is None:
             raise RuntimeError("Discord image publishing requires an image path.")
+        logger.info("Discord publishing image for challenge %s from %s", challenge.challenge_id, image_path)
         payload_json = json.dumps({"content": text})
         body, content_type = _multipart_encode(
             fields={"payload_json": payload_json},
@@ -108,6 +114,7 @@ class DiscordWebhookPublisher(Publisher):
         alt_text: str = "",
     ) -> None:
         if image_path is None:
+            logger.info("Discord publishing text-only media post")
             payload = {"content": text}
             request = Request(
                 self.webhook_url,
@@ -123,6 +130,7 @@ class DiscordWebhookPublisher(Publisher):
             return
 
         payload_json = json.dumps({"content": text})
+        logger.info("Discord publishing media post with image %s", image_path)
         body, content_type = _multipart_encode(
             fields={"payload_json": payload_json},
             file_field="files[0]",
@@ -157,6 +165,11 @@ class BlueSkyPublisher(Publisher):
     ) -> None:  # pragma: no cover - network integration
         if clip is not None:
             if not _is_mp4_url(clip.direct_url):
+                logger.info(
+                    "BlueSky clip for challenge %s is not mp4; falling back to external embed %s",
+                    challenge.challenge_id,
+                    clip.direct_url,
+                )
                 try:
                     from atproto import Client
                 except ImportError as exc:
@@ -165,12 +178,22 @@ class BlueSkyPublisher(Publisher):
                 client.login(self.handle, self.app_password)
                 _publish_bluesky_external_clip(client, challenge, clip)
                 return
+            logger.info(
+                "BlueSky publishing native video for challenge %s from %s",
+                challenge.challenge_id,
+                clip.direct_url,
+            )
             clip_path = _download_clip_to_temp(clip.direct_url)
             try:
                 session = _create_bluesky_session(self.handle, self.app_password)
                 try:
                     video_blob = _upload_bluesky_native_video(session, clip_path)
                 except Exception as native_exc:
+                    logger.warning(
+                        "BlueSky video service upload failed for challenge %s, trying uploadBlob fallback: %s",
+                        challenge.challenge_id,
+                        native_exc,
+                    )
                     try:
                         video_blob = _upload_bluesky_video_blob(session, clip_path)
                     except Exception as blob_exc:
@@ -199,6 +222,7 @@ class BlueSkyPublisher(Publisher):
         client.login(self.handle, self.app_password)
         if image_path is None:
             raise RuntimeError("BlueSky image publishing requires an image path.")
+        logger.info("BlueSky publishing image card for challenge %s from %s", challenge.challenge_id, image_path)
         with image_path.open("rb") as infile:
             blob = client.upload_blob(infile.read())
         client.send_post(
@@ -228,9 +252,11 @@ class BlueSkyPublisher(Publisher):
         client = Client()
         client.login(self.handle, self.app_password)
         if image_path is None:
+            logger.info("BlueSky publishing text-only media post")
             client.send_post(text=text)
             return
 
+        logger.info("BlueSky publishing media post with image %s", image_path)
         with image_path.open("rb") as infile:
             blob = client.upload_blob(infile.read())
         client.send_post(
@@ -291,6 +317,11 @@ class XPublisher(Publisher):
         )
         if clip is not None:
             if not _is_mp4_url(clip.direct_url):
+                logger.info(
+                    "X clip for challenge %s is not mp4; falling back to link post %s",
+                    challenge.challenge_id,
+                    clip.direct_url,
+                )
                 client.create_tweet(
                     text=format_x_clip_post_text(
                         challenge,
@@ -298,6 +329,7 @@ class XPublisher(Publisher):
                     )
                 )
                 return
+            logger.info("X publishing native video for challenge %s from %s", challenge.challenge_id, clip.direct_url)
             clip_path = _download_clip_to_temp(clip.direct_url)
             try:
                 media = api_v1.chunked_upload(
@@ -316,6 +348,7 @@ class XPublisher(Publisher):
 
         if image_path is None:
             raise RuntimeError("X image publishing requires an image path.")
+        logger.info("X publishing image card for challenge %s from %s", challenge.challenge_id, image_path)
         media = api_v1.media_upload(filename=str(image_path))
         client.create_tweet(text=format_x_post_text(challenge), media_ids=[media.media_id_string])
 
@@ -345,8 +378,10 @@ class XPublisher(Publisher):
             access_token_secret=self.access_token_secret,
         )
         if image_path is None:
+            logger.info("X publishing text-only media post")
             client.create_tweet(text=text)
             return
+        logger.info("X publishing media post with image %s", image_path)
         media = api_v1.media_upload(filename=str(image_path))
         client.create_tweet(text=text, media_ids=[media.media_id_string])
 
@@ -436,6 +471,7 @@ def _upload_bluesky_thumb(client: object, thumbnail_url: str) -> object | None:
 
 
 def _download_clip_to_temp(clip_url: str) -> Path:
+    logger.info("Downloading clip to temp storage from %s", clip_url)
     suffix = Path(urlparse(clip_url).path).suffix or ".mp4"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         request = Request(
@@ -448,7 +484,9 @@ def _download_clip_to_temp(clip_url: str) -> Path:
                 if not chunk:
                     break
                 tmp.write(chunk)
-        return Path(tmp.name)
+        temp_path = Path(tmp.name)
+    logger.info("Downloaded clip to %s", temp_path)
+    return temp_path
 
 
 def _is_mp4_url(url: str) -> bool:
@@ -485,6 +523,7 @@ def _clip_aspect_ratio(clip: ClipMedia) -> dict[str, int] | None:
 
 
 def _create_bluesky_session(handle: str, app_password: str) -> dict:
+    logger.debug("Creating BlueSky session for %s", handle)
     request = Request(
         "https://bsky.social/xrpc/com.atproto.server.createSession",
         data=json.dumps(
@@ -503,6 +542,7 @@ def _create_bluesky_session(handle: str, app_password: str) -> dict:
 
 
 def _upload_bluesky_native_video(session: dict, clip_path: Path) -> dict:
+    logger.info("Uploading BlueSky video via video service: %s", clip_path)
     service_token = _get_bluesky_service_auth(
         access_jwt=str(session["accessJwt"]),
         audience=f"did:web:{urlparse('https://bsky.social').hostname}",
@@ -533,6 +573,7 @@ def _upload_bluesky_native_video(session: dict, clip_path: Path) -> dict:
     job_status = _extract_bluesky_job_status(payload)
     blob = _extract_bluesky_blob(job_status)
     if blob is not None:
+        logger.info("BlueSky video service returned blob immediately")
         return blob
     job_id = str(job_status.get("jobId") or "")
     if not job_id:
@@ -549,6 +590,7 @@ def _upload_bluesky_native_video(session: dict, clip_path: Path) -> dict:
         status = _extract_bluesky_job_status(status_payload)
         blob = _extract_bluesky_blob(status)
         if blob is not None:
+            logger.info("BlueSky video processing completed for job %s", job_id)
             return blob
 
         state = str(status.get("state") or "").lower()
@@ -556,12 +598,14 @@ def _upload_bluesky_native_video(session: dict, clip_path: Path) -> dict:
             message = str(status.get("message") or "BlueSky video processing failed.")
             raise RuntimeError(message)
 
+        logger.debug("BlueSky video job %s still processing (state=%s)", job_id, state)
         time.sleep(1.0)
 
     raise RuntimeError("Timed out waiting for BlueSky video processing.")
 
 
 def _upload_bluesky_video_blob(session: dict, clip_path: Path) -> dict:
+    logger.info("Uploading BlueSky video via uploadBlob fallback: %s", clip_path)
     request = Request(
         "https://bsky.social/xrpc/com.atproto.repo.uploadBlob",
         data=clip_path.read_bytes(),
@@ -578,6 +622,7 @@ def _upload_bluesky_video_blob(session: dict, clip_path: Path) -> dict:
     blob = payload.get("blob")
     if not isinstance(blob, dict):
         raise RuntimeError("BlueSky uploadBlob response did not include a blob.")
+    logger.info("BlueSky uploadBlob fallback succeeded")
     return blob
 
 
@@ -607,6 +652,7 @@ def _create_bluesky_video_post(
     alt_text: str,
     aspect_ratio: dict[str, int] | None,
 ) -> None:
+    logger.info("Creating BlueSky native video post")
     embed = {
         "$type": "app.bsky.embed.video",
         "video": video_blob,
@@ -640,6 +686,7 @@ def _create_bluesky_video_post(
 
 
 def _publish_bluesky_external_clip(client: object, challenge: AbsChallenge, clip: ClipMedia) -> None:
+    logger.info("Creating BlueSky external clip post for challenge %s", challenge.challenge_id)
     try:
         from atproto import models
     except ImportError as exc:

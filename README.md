@@ -73,6 +73,7 @@ Suggested Railway setup:
 - `ABS_LOCAL_TIMEZONE`: local timezone used for weekly leaderboard timing, default `America/New_York`
 - `ABS_WEEKLY_SUMMARY_HOUR_LOCAL`: local-hour trigger for the weekly leaderboard snapshot, default `9`
 - `ABS_REGULAR_SEASON_LOOKAHEAD_DAYS`: future regular-season schedule window used to decide when to crown the season champion, default `120`
+- `ABS_LOG_LEVEL`: application log verbosity for Railway/stdout, default `INFO`. Set to `DEBUG` for clip-matching and upload-level detail.
 - `ABS_DISCORD_WEBHOOK_URL`: Discord webhook target
 - `ABS_BLUESKY_HANDLE`: BlueSky handle
 - `ABS_BLUESKY_APP_PASSWORD`: BlueSky app password
@@ -86,6 +87,7 @@ Suggested Railway setup:
 - The state file is local JSON. On Railway, move this to a persistent volume or database if you want dedupe and umpire challenge stats to survive redeploys and restarts.
 - The scheduler runs in UTC and watches yesterday/today/tomorrow for active games, while looking further ahead to decide when to wake for the next slate.
 - The bot prefers pitch-level `reviewDetails` when present. If MLB omits that, it falls back to the final pitch in the reviewed at-bat and records that selection reason in the output metadata.
+- The service now emits structured stdout logs for poll cycles, feed fetches, clip lookup decisions, publisher attempts, waits, successes, and failures so Railway logs are easier to follow.
 - Official MLB challenge clips are discovered from the game content feed, with `PlayId`-based Fastball search used as an identity hint to keep same-game challenge matches separated.
 - Clip preference is tiered: the bot posts `bdata-producedclips` immediately, waits briefly for `bdata` when only `mlb-cuts` is available, keeps checking longer for any official clip while the game is live, extends that wait window after the game ends, then finally falls back to a rendered graphic if no usable clip appears in time.
 - The displayed umpire rate is a challenge-specific upheld rate, not an all-pitches accuracy estimate.

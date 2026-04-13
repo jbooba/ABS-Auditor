@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Set
 from urllib.parse import urlencode
@@ -26,6 +27,7 @@ SKIPPED_DETAILED_STATES = {
     "Cancelled",
     "Postponed",
 }
+logger = logging.getLogger(__name__)
 
 
 class MlbStatsApiClient:
@@ -33,6 +35,7 @@ class MlbStatsApiClient:
         self.timeout_seconds = timeout_seconds
 
     def fetch_json(self, url: str) -> Dict[str, Any]:
+        logger.debug("Fetching MLB JSON: %s", url)
         request = Request(
             url,
             headers={
@@ -41,12 +44,15 @@ class MlbStatsApiClient:
             },
         )
         with urlopen(request, timeout=self.timeout_seconds) as response:
-            return json.loads(response.read().decode("utf-8"))
+            payload = json.loads(response.read().decode("utf-8"))
+        logger.debug("Fetched MLB JSON successfully: %s", url)
+        return payload
 
     def schedule_for_dates(self, dates: Iterable[str]) -> List[Dict[str, Any]]:
+        date_list = list(dates)
         games: List[Dict[str, Any]] = []
         seen: Set[int] = set()
-        for date in dates:
+        for date in date_list:
             query = urlencode({"sportId": 1, "date": date})
             data = self.fetch_json(f"https://statsapi.mlb.com/api/v1/schedule?{query}")
             for day in data.get("dates", []):
@@ -55,6 +61,7 @@ class MlbStatsApiClient:
                     if game_pk and game_pk not in seen:
                         seen.add(game_pk)
                         games.append(game)
+        logger.debug("Collected %s unique game(s) for dates=%s", len(games), date_list)
         return games
 
     def fetch_live_game_feed(self, game_pk: int) -> Dict[str, Any]:
@@ -65,8 +72,10 @@ class MlbStatsApiClient:
         last_error: Exception | None = None
         for url in urls:
             try:
+                logger.debug("Fetching live feed for game %s via %s", game_pk, url)
                 return self.fetch_json(url)
             except Exception as exc:
+                logger.warning("Failed to fetch live feed for game %s via %s: %s", game_pk, url, exc)
                 last_error = exc
         if last_error is None:
             raise RuntimeError(f"Unable to fetch MLB live feed for game {game_pk}")
@@ -106,6 +115,15 @@ class MlbStatsApiClient:
     @staticmethod
     def detailed_state(game: Dict[str, Any]) -> str:
         return game.get("status", {}).get("detailedState", "").strip()
+
+    @staticmethod
+    def matchup_label(game: Dict[str, Any]) -> str:
+        teams = game.get("teams", {})
+        away = teams.get("away", {}).get("team", {})
+        home = teams.get("home", {}).get("team", {})
+        away_label = away.get("abbreviation") or away.get("name") or "Away"
+        home_label = home.get("abbreviation") or home.get("name") or "Home"
+        return f"{away_label} @ {home_label}"
 
     @staticmethod
     def game_type(game: Dict[str, Any]) -> str:

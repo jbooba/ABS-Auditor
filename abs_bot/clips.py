@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 import unicodedata
@@ -23,6 +24,7 @@ ALLOWED_CLIP_HOSTS = {
 RAW_CLIP_HOSTS = {"bdata-producedclips.mlb.com"}
 GAME_CONTENT_CACHE_TTL_SECONDS = 30.0
 _GAME_CONTENT_CACHE: dict[int, tuple[float, tuple[dict[str, Any], ...]]] = {}
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -60,6 +62,7 @@ def lookup_abs_clip_options(
     excluded_direct_urls: Iterable[str] | None = None,
 ) -> ClipLookupResult:
     if not challenge.pitch.play_id:
+        logger.debug("Challenge %s has no play_id; skipping clip lookup", challenge.challenge_id)
         return ClipLookupResult(raw_clip=None, highlight_clip=None)
 
     excluded_urls = {
@@ -115,12 +118,21 @@ def lookup_abs_clip_options(
             )
 
     if not candidates:
+        logger.info("No clip candidates found for challenge %s", challenge.challenge_id)
         return ClipLookupResult(raw_clip=None, highlight_clip=None)
 
-    return ClipLookupResult(
+    result = ClipLookupResult(
         raw_clip=_choose_best_clip(candidates, clip_kind="raw"),
         highlight_clip=_choose_best_clip(candidates, clip_kind="highlight"),
     )
+    logger.info(
+        "Clip lookup for %s found %s candidate(s); raw=%s highlight=%s",
+        challenge.challenge_id,
+        len(candidates),
+        result.raw_clip.direct_url if result.raw_clip else None,
+        result.highlight_clip.direct_url if result.highlight_clip else None,
+    )
+    return result
 
 
 def _fetch_game_content_items(game_pk: int) -> tuple[dict[str, Any], ...]:
@@ -129,6 +141,7 @@ def _fetch_game_content_items(game_pk: int) -> tuple[dict[str, Any], ...]:
     if cached is not None:
         fetched_at, items = cached
         if (now - fetched_at) < GAME_CONTENT_CACHE_TTL_SECONDS:
+            logger.debug("Using cached game content for game %s", game_pk)
             return items
 
     url = f"https://statsapi.mlb.com/api/v1/game/{game_pk}/content?language=en"
@@ -136,6 +149,7 @@ def _fetch_game_content_items(game_pk: int) -> tuple[dict[str, Any], ...]:
     items = ((data.get("highlights") or {}).get("highlights") or {}).get("items") or []
     normalized_items = tuple(item for item in items if isinstance(item, dict))
     _GAME_CONTENT_CACHE[game_pk] = (now, normalized_items)
+    logger.debug("Fetched %s content item(s) for game %s", len(normalized_items), game_pk)
     return normalized_items
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import sys
 import threading
@@ -35,6 +36,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--local-timezone", type=str, default=os.getenv("ABS_LOCAL_TIMEZONE", "America/New_York"))
     parser.add_argument("--weekly-summary-hour-local", type=int, default=int(os.getenv("ABS_WEEKLY_SUMMARY_HOUR_LOCAL", "9")))
     parser.add_argument("--regular-season-lookahead-days", type=int, default=int(os.getenv("ABS_REGULAR_SEASON_LOOKAHEAD_DAYS", "120")))
+    parser.add_argument("--log-level", type=str, default=os.getenv("ABS_LOG_LEVEL", "INFO"))
     parser.add_argument("--port", type=int, default=int(os.getenv("PORT", "8080")))
     parser.add_argument("--once", action="store_true", help="Run a single pass and exit")
     return parser.parse_args()
@@ -42,12 +44,33 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    _configure_logging(args.log_level)
+    logger = logging.getLogger(__name__)
 
     if args.sample_json:
         return run_sample(args.sample_json, args.output_dir)
 
     client = MlbStatsApiClient()
     publishers = publishers_from_env()
+    logger.info(
+        "Starting ABS bot",
+        extra={
+            "event": "startup",
+        },
+    )
+    logger.info(
+        "Runtime config: publishers=%s poll=%ss pregame_poll=%ss clip_wait=%ss raw_wait=%ss final_clip_wait=%ss keep_artifacts=%s state_file=%s output_dir=%s log_level=%s",
+        len(publishers),
+        args.poll_seconds,
+        args.pregame_poll_seconds,
+        args.clip_wait_seconds,
+        args.raw_clip_wait_seconds,
+        args.final_clip_wait_seconds,
+        args.keep_artifacts,
+        args.state_file,
+        args.output_dir,
+        args.log_level.upper(),
+    )
     service = AbsBotService(
         client=client,
         publishers=publishers,
@@ -68,6 +91,7 @@ def main() -> int:
     )
 
     if args.once:
+        logger.info("Running single poll cycle (--once)")
         service.poll_once()
         print(json.dumps(service.snapshot(), indent=2))
         return 0
@@ -95,6 +119,8 @@ def run_sample(sample_path: Path, output_dir: Path) -> int:
 
 
 def run_http_server(port: int, service: AbsBotService) -> None:
+    logger = logging.getLogger(__name__)
+
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802
             if self.path in {"/", "/health"}:
@@ -117,7 +143,7 @@ def run_http_server(port: int, service: AbsBotService) -> None:
             self.wfile.write(body)
 
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
-    print(f"ABS bot listening on 0.0.0.0:{port}")
+    logger.info("ABS bot listening on 0.0.0.0:%s", port)
     try:
         server.serve_forever()
     except KeyboardInterrupt:  # pragma: no cover - manual stop
@@ -131,6 +157,16 @@ def _env_flag(name: str, default: bool) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _configure_logging(log_level: str) -> None:
+    level_name = str(log_level or "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+        force=True,
+    )
 
 
 if __name__ == "__main__":
