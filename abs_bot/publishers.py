@@ -168,7 +168,17 @@ class BlueSkyPublisher(Publisher):
             clip_path = _download_clip_to_temp(clip.direct_url)
             try:
                 session = _create_bluesky_session(self.handle, self.app_password)
-                video_blob = _upload_bluesky_native_video(session, clip_path)
+                try:
+                    video_blob = _upload_bluesky_native_video(session, clip_path)
+                except Exception as native_exc:
+                    try:
+                        video_blob = _upload_bluesky_video_blob(session, clip_path)
+                    except Exception as blob_exc:
+                        raise RuntimeError(
+                            "BlueSky native video upload failed via both the video service "
+                            f"and direct uploadBlob fallback. Service error: {native_exc}; "
+                            f"uploadBlob error: {blob_exc}"
+                        ) from blob_exc
                 _create_bluesky_video_post(
                     session=session,
                     text=format_bluesky_clip_embed_text(challenge),
@@ -513,6 +523,8 @@ def _upload_bluesky_native_video(session: dict, clip_path: Path) -> dict:
         headers={
             "Authorization": f"Bearer {service_token}",
             "Content-Type": "video/mp4",
+            "Content-Length": str(clip_path.stat().st_size),
+            "Connection": "close",
             "User-Agent": "mlb-abs-bot/0.1",
         },
         method="POST",
@@ -547,6 +559,26 @@ def _upload_bluesky_native_video(session: dict, clip_path: Path) -> dict:
         time.sleep(1.0)
 
     raise RuntimeError("Timed out waiting for BlueSky video processing.")
+
+
+def _upload_bluesky_video_blob(session: dict, clip_path: Path) -> dict:
+    request = Request(
+        "https://bsky.social/xrpc/com.atproto.repo.uploadBlob",
+        data=clip_path.read_bytes(),
+        headers={
+            "Authorization": f"Bearer {session['accessJwt']}",
+            "Content-Type": "video/mp4",
+            "Content-Length": str(clip_path.stat().st_size),
+            "Connection": "close",
+            "User-Agent": "mlb-abs-bot/0.1",
+        },
+        method="POST",
+    )
+    payload = _read_json_response(request)
+    blob = payload.get("blob")
+    if not isinstance(blob, dict):
+        raise RuntimeError("BlueSky uploadBlob response did not include a blob.")
+    return blob
 
 
 def _get_bluesky_service_auth(*, access_jwt: str, audience: str, lxm: str) -> str:
