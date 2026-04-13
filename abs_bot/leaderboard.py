@@ -24,8 +24,8 @@ SUMMARY_TOP = 218
 SUMMARY_CARD_HEIGHT = 150
 SUMMARY_CARD_GAP = 26
 TABLE_TOP = 404
-TABLE_HEADER_HEIGHT = 46
-ROW_HEIGHT = 34
+TABLE_HEADER_HEIGHT = 50
+ROW_HEIGHT = 38
 TABLE_BOTTOM_PADDING = 72
 TABLE_LEFT = OUTER_MARGIN + 10
 TABLE_RIGHT = LEADERBOARD_WIDTH - OUTER_MARGIN - 10
@@ -108,8 +108,8 @@ def build_weekly_leaderboard(
     week_end: date,
 ) -> UmpireLeaderboard:
     standings = build_umpire_standings(umpire_stats)
-    title = f"ABS Umpire Leaderboard ({week_start.strftime('%b %d')} - {week_end.strftime('%b %d')})"
-    subtitle = f"Week ending {week_end.strftime('%b %d, %Y')} | Season-to-date upheld rate"
+    title = f"Weekly ABS Umpire Leaderboard (Thru {week_end.strftime('%b %d')})"
+    subtitle = f"Season-to-date HP umpire ABS upheld rate through {week_end.strftime('%b %d, %Y')}"
     leaderboard_id = f"leaderboard:weekly:{week_end.isoformat()}"
     return UmpireLeaderboard(
         leaderboard_id=leaderboard_id,
@@ -140,28 +140,31 @@ def build_season_champion_leaderboard(
 
 def format_leaderboard_post_text(leaderboard: UmpireLeaderboard, *, limit: int = 280) -> str:
     top_five = leaderboard.standings[:5]
-    lines = [leaderboard.title]
+    title_block = [leaderboard.title]
     if leaderboard.kind == "season" and top_five:
         leader = top_five[0]
-        lines.append(
+        title_block.append(
             f"Champion: {leader.name} - "
             f"{leader.upheld_percent:.1f}% ({leader.record_display}, {leader.total})"
         )
+    standings_block = []
     for index, standing in enumerate(top_five, start=1):
-        lines.append(
+        standings_block.append(
             f"{index}. {_truncate_name(standing.name, 18)} - "
             f"{standing.upheld_percent:.1f}% ({standing.record_display}, {standing.total})"
         )
 
+    blocks = [title_block, standings_block]
     most_challenged = _most_challenged_standing(leaderboard.standings)
     if most_challenged is not None:
-        lines.append(
+        blocks.append(
+            [
             f"Most challenged: {_truncate_name(most_challenged.name, 18)} - "
             f"{most_challenged.upheld_percent:.1f}% "
             f"({most_challenged.record_display}, {most_challenged.total})"
+            ]
         )
-    lines.append("Totals show sample size. Full table attached.")
-    return _truncate_lines(lines, limit)
+    return _truncate_blocks(blocks, limit)
 
 
 def format_leaderboard_alt_text(leaderboard: UmpireLeaderboard) -> str:
@@ -201,8 +204,8 @@ def render_umpire_leaderboard(leaderboard: UmpireLeaderboard, output_dir: Path) 
     card_label_font = _load_font(18, bold=True)
     card_body_font = _load_font(28, bold=True)
     card_small_font = _load_font(20)
-    header_font = _load_font(22, bold=True)
-    body_font = _load_font(21)
+    header_font = _load_font(24, bold=True)
+    body_font = _load_font(23, bold=True)
 
     draw.rounded_rectangle(
         (OUTER_MARGIN, 24, LEADERBOARD_WIDTH - OUTER_MARGIN, image_height - 24),
@@ -304,9 +307,9 @@ def _draw_summary_cards(
         (
             "HOW TO READ THIS",
             (
-                "Rate ranks first",
+                "Season-to-date standings",
                 "Total challenges = sample size",
-                "Early-season rates can swing fast",
+                "Small samples can swing fast",
             ),
             SUMMARY_CARD_ALT,
         ),
@@ -380,7 +383,7 @@ def _draw_table_headers(draw: "ImageDraw.ImageDraw", font, *, column_left: float
         ("Total", columns["total"]),
     ]
     for label, x in headers:
-        draw.text((x, column_top + 11), label, fill="#ffffff", font=font)
+        draw.text((x, column_top + 12), label, fill="#ffffff", font=font)
 
 
 def _draw_standing_row(
@@ -405,9 +408,9 @@ def _column_positions(column_left: float, column_width: float) -> dict[str, floa
     return {
         "rank": column_left + 18,
         "name": column_left + 88,
-        "rate": column_left + (column_width * 0.63),
-        "record": column_left + (column_width * 0.79),
-        "total": column_left + (column_width * 0.91),
+        "rate": column_left + (column_width * 0.61),
+        "record": column_left + (column_width * 0.775),
+        "total": column_left + (column_width * 0.905),
     }
 
 
@@ -432,18 +435,28 @@ def _truncate_name(name: str, limit: int) -> str:
     return f"{trimmed}..."
 
 
-def _truncate_lines(lines: Iterable[str], limit: int) -> str:
-    active_lines = [line for line in lines if line]
-    text = "\n".join(active_lines)
+def _truncate_blocks(blocks: Iterable[Iterable[str]], limit: int) -> str:
+    active_blocks = [
+        [line for line in block if line]
+        for block in blocks
+    ]
+    active_blocks = [block for block in active_blocks if block]
+    text = "\n\n".join("\n".join(block) for block in active_blocks)
     if len(text) <= limit:
         return text
 
-    if active_lines and active_lines[-1] == "Totals show sample size. Full table attached.":
-        active_lines[-1] = "Totals show sample size."
-        text = "\n".join(active_lines)
+    collapsed = [line for block in active_blocks for line in block]
+    text = "\n".join(collapsed)
+    if len(text) <= limit:
+        return text
+
+    if active_blocks and len(active_blocks) >= 3:
+        condensed_blocks = active_blocks[:2]
+        text = "\n\n".join("\n".join(block) for block in condensed_blocks)
         if len(text) <= limit:
             return text
 
+    active_lines = list(collapsed)
     while len("\n".join(active_lines)) > limit and len(active_lines) > 3:
         active_lines.pop()
 

@@ -5,7 +5,7 @@ import logging
 import threading
 from collections import deque
 from dataclasses import replace
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Set
 from zoneinfo import ZoneInfo
@@ -538,20 +538,31 @@ class AbsBotService:
 
     def _maybe_publish_weekly_leaderboard(self, *, now: datetime) -> int:
         local_now = now.astimezone(self.local_tz)
-        current_week_start = local_now.date() - timedelta(days=local_now.weekday())
+        week_end = self._weekly_summary_week_end(local_now)
+        week_start = week_end - timedelta(days=6)
         due_at = datetime.combine(
-            current_week_start,
+            week_end,
             datetime.min.time(),
             tzinfo=self.local_tz,
         ) + timedelta(hours=self.weekly_summary_hour_local)
         if local_now < due_at:
+            logger.debug(
+                "Weekly leaderboard for %s not due yet (local_now=%s due_at=%s)",
+                week_end,
+                local_now,
+                due_at,
+            )
             return 0
-        week_end = current_week_start - timedelta(days=1)
-        week_start = week_end - timedelta(days=6)
         leaderboard_id = f"leaderboard:weekly:{week_end.isoformat()}"
         if leaderboard_id in self.seen_summary_ids:
             return 0
         if not self._regular_season_is_active_or_recent(now):
+            return 0
+        if self._has_unfinished_regular_games_for_local_date(week_end):
+            logger.info(
+                "Weekly leaderboard for %s is waiting on unfinished Sunday games",
+                week_end,
+            )
             return 0
         leaderboard = build_weekly_leaderboard(
             umpire_stats=self._umpire_stats_snapshot(),
@@ -559,6 +570,48 @@ class AbsBotService:
             week_end=week_end,
         )
         return self._publish_leaderboard(leaderboard)
+
+    def _weekly_summary_week_end(self, local_now: datetime) -> date:
+        days_since_sunday = (local_now.weekday() + 1) % 7
+        return local_now.date() - timedelta(days=days_since_sunday)
+
+    def _has_unfinished_regular_games_for_local_date(self, target_date: date) -> bool:
+        dates = self._schedule_dates_for_local_date(target_date)
+        games = self.client.schedule_for_dates(dates)
+        relevant_games = [
+            game
+            for game in games
+            if self.client.game_type(game) == "R"
+            and self.client.should_track_game(game)
+            and self._game_local_date(game) == target_date
+        ]
+        unfinished_games = [
+            game
+            for game in relevant_games
+            if not self.client.is_terminal_game(game)
+        ]
+        logger.info(
+            "Weekly leaderboard readiness for %s: relevant_games=%s unfinished=%s",
+            target_date,
+            len(relevant_games),
+            len(unfinished_games),
+        )
+        return bool(unfinished_games)
+
+    def _schedule_dates_for_local_date(self, local_date: date) -> list[str]:
+        local_start = datetime.combine(local_date, datetime.min.time(), tzinfo=self.local_tz)
+        local_end = local_start + timedelta(days=1)
+        utc_dates = {
+            local_start.astimezone(timezone.utc).date().isoformat(),
+            local_end.astimezone(timezone.utc).date().isoformat(),
+        }
+        return sorted(utc_dates)
+
+    def _game_local_date(self, game: Dict[str, Any]) -> date | None:
+        game_time = self.client.game_datetime_utc(game)
+        if game_time is None:
+            return None
+        return game_time.astimezone(self.local_tz).date()
 
     def _maybe_publish_season_champion(self, *, now: datetime) -> int:
         local_now = now.astimezone(self.local_tz)
