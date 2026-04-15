@@ -310,6 +310,8 @@ def _bluesky_result_line(challenge: AbsChallenge) -> str:
 
 def _clip_challenge_line(challenge: AbsChallenge) -> str:
     challenged_call = _challenged_call_phrase(challenge)
+    if challenge.original_call == "Called Strike":
+        return f"{challenge.batter_name} challenged the called strike."
     if challenge.challenger_name == challenge.batter_name:
         return (
             f"{challenge.challenger_name} challenged the {challenged_call} "
