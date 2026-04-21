@@ -52,6 +52,8 @@ SUMMARY_CARD_BG = "#f8f1e3"
 SUMMARY_CARD_ALT = "#fdf7eb"
 SUMMARY_CARD_HOT = "#fce8d5"
 
+POWER_SCORE_EXPLANATION = "Power Score = Bayes + Wilson + sample size + momentum."
+
 
 @dataclass(frozen=True)
 class UmpireStanding:
@@ -369,6 +371,7 @@ def format_leaderboard_post_text(leaderboard: UmpireLeaderboard, *, limit: int =
             f"{standing.upheld_percent:.1f}% ({standing.record_display}, {standing.total})"
         )
 
+    explanation_block = [POWER_SCORE_EXPLANATION]
     blocks = [title_block, standings_block]
     most_challenged = _most_challenged_standing(leaderboard.standings)
     if most_challenged is not None:
@@ -379,7 +382,15 @@ def format_leaderboard_post_text(leaderboard: UmpireLeaderboard, *, limit: int =
                 f"({most_challenged.record_display}, {most_challenged.total})"
             ]
         )
-    return _truncate_blocks(blocks, limit)
+    blocks.append(explanation_block)
+
+    text = _truncate_blocks(blocks, limit)
+    if POWER_SCORE_EXPLANATION in text:
+        return text
+
+    # If space is tight, keep the explainer and drop the least important block first.
+    prioritized_blocks = [title_block, standings_block, explanation_block]
+    return _truncate_blocks(prioritized_blocks, limit)
 
 
 def format_leaderboard_alt_text(leaderboard: UmpireLeaderboard) -> str:
