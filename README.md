@@ -73,6 +73,7 @@ Suggested Railway setup:
 - `ABS_LOCAL_TIMEZONE`: local timezone used for weekly leaderboard timing, default `America/New_York`
 - `ABS_WEEKLY_SUMMARY_HOUR_LOCAL`: earliest local Sunday hour when the weekly leaderboard becomes eligible to post; the bot still waits until the Sunday slate is fully finished, default `9`
 - `ABS_REGULAR_SEASON_LOOKAHEAD_DAYS`: future regular-season schedule window used to decide when to crown the season champion, default `120`
+- `ABS_SAVANT_SYNC_HOUR_LOCAL`: earliest local hour for the daily Baseball Savant enrichment sync after the initial bootstrap, default `5`
 - `ABS_LOG_LEVEL`: application log verbosity for Railway/stdout, default `INFO`. Set to `DEBUG` for clip-matching and upload-level detail.
 - `ABS_DISCORD_WEBHOOK_URL`: Discord webhook target
 - `ABS_BLUESKY_HANDLE`: BlueSky handle
@@ -91,7 +92,8 @@ Suggested Railway setup:
 - Official MLB challenge clips are discovered from the game content feed, with `PlayId`-based Fastball search used as an identity hint to keep same-game challenge matches separated.
 - Clip preference is tiered: the bot posts `bdata-producedclips` immediately, waits briefly for `bdata` when only `mlb-cuts` is available, keeps checking longer for any official clip while the game is live, extends that wait window after the game ends, then finally falls back to a rendered graphic if no usable clip appears in time.
 - The displayed umpire rate is a challenge-specific upheld rate, not an all-pitches accuracy estimate.
-- Weekly umpire leaderboard posts are generated from the bot's season-to-date HP umpire challenge ledger and are only posted after the relevant Sunday slate is fully finished in the configured local timezone.
+- Weekly umpire leaderboard posts are generated from the bot's season-to-date HP umpire challenge ledger, enriched daily from the Savant ABS team-summary service with challenge probability, reasonable-attempt, edge-distance, and run-value data.
+- Because Savant's full ABS metrics land the next day, the weekly leaderboard waits for both the Sunday slate to finish and Savant coverage to reach that Sunday before posting.
 - The renderer writes PNG when Pillow is installed. If Pillow is unavailable, it falls back to SVG.
 - By default, service-mode artifacts are deleted after successful posting. Sample/manual runs still keep their rendered outputs.
 - A `Procfile` and `railway_start.py` launcher are included so Railway can start the service even if the repo contents end up one folder deeper than expected during deployment.

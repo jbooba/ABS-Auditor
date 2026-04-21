@@ -36,6 +36,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--local-timezone", type=str, default=os.getenv("ABS_LOCAL_TIMEZONE", "America/New_York"))
     parser.add_argument("--weekly-summary-hour-local", type=int, default=int(os.getenv("ABS_WEEKLY_SUMMARY_HOUR_LOCAL", "9")))
     parser.add_argument("--regular-season-lookahead-days", type=int, default=int(os.getenv("ABS_REGULAR_SEASON_LOOKAHEAD_DAYS", "120")))
+    parser.add_argument("--savant-sync-hour-local", type=int, default=int(os.getenv("ABS_SAVANT_SYNC_HOUR_LOCAL", "5")))
     parser.add_argument("--log-level", type=str, default=os.getenv("ABS_LOG_LEVEL", "INFO"))
     parser.add_argument("--port", type=int, default=int(os.getenv("PORT", "8080")))
     parser.add_argument("--once", action="store_true", help="Run a single pass and exit")
@@ -59,7 +60,7 @@ def main() -> int:
         },
     )
     logger.info(
-        "Runtime config: publishers=%s poll=%ss pregame_poll=%ss clip_wait=%ss raw_wait=%ss final_clip_wait=%ss keep_artifacts=%s state_file=%s output_dir=%s log_level=%s",
+        "Runtime config: publishers=%s poll=%ss pregame_poll=%ss clip_wait=%ss raw_wait=%ss final_clip_wait=%ss keep_artifacts=%s state_file=%s output_dir=%s log_level=%s savant_sync_hour_local=%s",
         len(publishers),
         args.poll_seconds,
         args.pregame_poll_seconds,
@@ -70,6 +71,7 @@ def main() -> int:
         args.state_file,
         args.output_dir,
         args.log_level.upper(),
+        args.savant_sync_hour_local,
     )
     service = AbsBotService(
         client=client,
@@ -88,6 +90,7 @@ def main() -> int:
         local_timezone=args.local_timezone,
         weekly_summary_hour_local=args.weekly_summary_hour_local,
         regular_season_lookahead_days=args.regular_season_lookahead_days,
+        savant_sync_hour_local=args.savant_sync_hour_local,
     )
 
     if args.once:

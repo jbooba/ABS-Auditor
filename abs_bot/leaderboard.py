@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
-from math import ceil
+from datetime import date, datetime, timedelta
+from math import ceil, sqrt
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 from .render import CARD_BG, CARD_MUTED, CARD_OUTLINE, _load_font
 
@@ -16,14 +16,28 @@ except ImportError:  # pragma: no cover - fallback path
     PIL_AVAILABLE = False
 
 
+# ABS power score tuning constants.
+POWER_PRIOR_WEIGHT = 12.0
+POWER_WILSON_Z = 1.96
+POWER_SAMPLE_CAP = 30
+POWER_RECENT_DAYS = 14
+POWER_RECENT_SAMPLE_CAP = 8.0
+POWER_MOMENTUM_MAX_ABS = 0.08
+POWER_DIFFICULTY_SCALE = 0.06
+POWER_DIFFICULTY_MAX_ABS = 0.03
+POWER_WEIGHT_BAYES = 0.55
+POWER_WEIGHT_WILSON = 0.35
+POWER_WEIGHT_RAW = 0.10
+POWER_WEIGHT_SAMPLE = 0.08
+
 LEADERBOARD_WIDTH = 2000
 LEADERBOARD_MIN_HEIGHT = 1450
 OUTER_MARGIN = 42
 HEADER_BAND_HEIGHT = 150
 SUMMARY_TOP = 218
-SUMMARY_CARD_HEIGHT = 150
-SUMMARY_CARD_GAP = 26
-TABLE_TOP = 404
+SUMMARY_CARD_HEIGHT = 164
+SUMMARY_CARD_GAP = 18
+TABLE_TOP = 428
 TABLE_HEADER_HEIGHT = 50
 ROW_HEIGHT = 38
 TABLE_BOTTOM_PADDING = 72
@@ -36,6 +50,7 @@ TABLE_TOP_FIVE = "#f6efe0"
 TABLE_MOST_CHALLENGED = "#fff1dd"
 SUMMARY_CARD_BG = "#f8f1e3"
 SUMMARY_CARD_ALT = "#fdf7eb"
+SUMMARY_CARD_HOT = "#fce8d5"
 
 
 @dataclass(frozen=True)
@@ -46,10 +61,27 @@ class UmpireStanding:
     confirmed: int
     overturned: int
     upheld_rate: float
+    bayes_rate: float
+    wilson: float
+    sample_factor: float
+    recent_confirmed: int
+    recent_overturned: int
+    momentum: float
+    difficulty_avg: float | None
+    difficulty_bonus: float
+    abs_power_score: float
 
     @property
     def upheld_percent(self) -> float:
         return self.upheld_rate * 100.0
+
+    @property
+    def bayes_percent(self) -> float:
+        return self.bayes_rate * 100.0
+
+    @property
+    def wilson_percent(self) -> float:
+        return self.wilson * 100.0
 
     @property
     def summary(self) -> str:
@@ -59,6 +91,20 @@ class UmpireStanding:
     def record_display(self) -> str:
         return f"{self.confirmed}-{self.overturned}"
 
+    @property
+    def recent_total(self) -> int:
+        return self.recent_confirmed + self.recent_overturned
+
+    @property
+    def recent_record_display(self) -> str:
+        return f"{self.recent_confirmed}-{self.recent_overturned}"
+
+    @property
+    def momentum_display(self) -> str:
+        points = self.momentum * 100.0
+        sign = "+" if points > 0 else ""
+        return f"{sign}{points:.1f}"
+
 
 @dataclass(frozen=True)
 class UmpireLeaderboard:
@@ -67,9 +113,132 @@ class UmpireLeaderboard:
     title: str
     subtitle: str
     standings: tuple[UmpireStanding, ...]
+    league_average: float
 
 
-def build_umpire_standings(umpire_stats: dict[str, dict]) -> tuple[UmpireStanding, ...]:
+def wilson_lower_bound(wins: int, total: int, z: float = POWER_WILSON_Z) -> float:
+    """Return a conservative lower-bound estimate for a binomial success rate."""
+    if total <= 0:
+        return 0.0
+    proportion = wins / total
+    z2 = z * z
+    denominator = 1.0 + (z2 / total)
+    center = proportion + (z2 / (2.0 * total))
+    margin = z * sqrt(
+        (proportion * (1.0 - proportion) / total)
+        + (z2 / (4.0 * total * total))
+    )
+    return max(0.0, (center - margin) / denominator)
+
+
+def bayesian_rate(
+    wins: int,
+    total: int,
+    league_avg: float,
+    prior_weight: float = POWER_PRIOR_WEIGHT,
+) -> float:
+    """Shrink each umpire toward the league average to calm tiny samples."""
+    if total <= 0:
+        return league_avg
+    return (wins + (prior_weight * league_avg)) / (total + prior_weight)
+
+
+def sample_factor(total: int, sample_cap: int = POWER_SAMPLE_CAP) -> float:
+    """Return a saturating sample bonus from 0 to 1."""
+    if total <= 0:
+        return 0.0
+    return min(1.0, sqrt(total / sample_cap))
+
+
+def momentum_adjustment(
+    recent_wins: int | None,
+    recent_total: int | None,
+    league_avg: float,
+    max_abs: float = POWER_MOMENTUM_MAX_ABS,
+) -> float:
+    """Apply a small recent-form nudge when enough 14-day data exists."""
+    if recent_wins is None or recent_total is None or recent_total < 3:
+        return 0.0
+    recent_rate = recent_wins / recent_total
+    strength = min(1.0, recent_total / POWER_RECENT_SAMPLE_CAP)
+    value = (recent_rate - league_avg) * strength
+    return max(-max_abs, min(max_abs, value))
+
+
+def difficulty_adjustment(
+    difficulty_avg: float | None,
+    max_abs: float = POWER_DIFFICULTY_MAX_ABS,
+) -> float:
+    """Apply an optional bonus/penalty for handling tougher upheld calls."""
+    if difficulty_avg is None:
+        return 0.0
+    value = (difficulty_avg - 0.5) * POWER_DIFFICULTY_SCALE
+    return max(-max_abs, min(max_abs, value))
+
+
+def abs_power_score(
+    wins: int,
+    losses: int,
+    league_avg: float,
+    *,
+    recent_wins: int | None = None,
+    recent_losses: int | None = None,
+    difficulty_avg: float | None = None,
+    prior_weight: float = POWER_PRIOR_WEIGHT,
+    sample_cap: int = POWER_SAMPLE_CAP,
+) -> dict[str, float | int | None]:
+    """Compute the weekly ABS ranking components for one umpire."""
+    total = wins + losses
+    raw_rate = (wins / total) if total > 0 else 0.0
+    bayes = bayesian_rate(wins, total, league_avg, prior_weight)
+    wilson = wilson_lower_bound(wins, total)
+    sample = sample_factor(total, sample_cap)
+
+    recent_total = None
+    if recent_wins is not None and recent_losses is not None:
+        recent_total = recent_wins + recent_losses
+
+    momentum = momentum_adjustment(recent_wins, recent_total, league_avg)
+    difficulty = difficulty_adjustment(difficulty_avg)
+
+    core = (
+        (POWER_WEIGHT_BAYES * bayes)
+        + (POWER_WEIGHT_WILSON * wilson)
+        + (POWER_WEIGHT_RAW * raw_rate)
+    )
+    adjusted = core + (POWER_WEIGHT_SAMPLE * sample) + momentum + difficulty
+    score = max(0.0, min(100.0, adjusted * 100.0))
+
+    return {
+        "wins": wins,
+        "losses": losses,
+        "total": total,
+        "raw_rate": raw_rate,
+        "bayes_rate": bayes,
+        "wilson": wilson,
+        "sample_factor": sample,
+        "momentum": momentum,
+        "difficulty_bonus": difficulty,
+        "difficulty_avg": difficulty_avg,
+        "recent_wins": recent_wins,
+        "recent_losses": recent_losses,
+        "abs_power_score": score,
+    }
+
+
+def build_umpire_standings(
+    umpire_stats: dict[str, dict],
+    *,
+    challenge_history: Iterable[dict[str, Any]] = (),
+    as_of: date | None = None,
+    include_momentum: bool = True,
+) -> tuple[UmpireStanding, ...]:
+    """Build season-to-date standings sorted by ABS power score."""
+    as_of = as_of or date.today()
+    league_average = _league_average(umpire_stats)
+    recent_stats = _recent_stats_by_umpire(challenge_history, as_of=as_of)
+    difficulty_averages = _difficulty_average_by_umpire(challenge_history)
+
     standings: list[UmpireStanding] = []
     for key, value in umpire_stats.items():
         if not isinstance(value, dict):
@@ -79,7 +248,24 @@ def build_umpire_standings(umpire_stats: dict[str, dict]) -> tuple[UmpireStandin
         overturned = int(value.get("overturned", 0) or 0)
         if total <= 0:
             continue
-        name = str(value.get("name", "")).strip() or key
+
+        name = str(value.get("name", "")).strip() or str(key)
+        recent = recent_stats.get(str(key), {"confirmed": 0, "overturned": 0})
+        recent_confirmed = int(recent.get("confirmed", 0) or 0)
+        recent_overturned = int(recent.get("overturned", 0) or 0)
+        difficulty_avg = _coerce_optional_float(value.get("difficulty_avg"))
+        if difficulty_avg is None:
+            difficulty_avg = difficulty_averages.get(str(key))
+
+        components = abs_power_score(
+            confirmed,
+            overturned,
+            league_average,
+            recent_wins=recent_confirmed if include_momentum else None,
+            recent_losses=recent_overturned if include_momentum else None,
+            difficulty_avg=difficulty_avg,
+        )
+
         standings.append(
             UmpireStanding(
                 key=str(key),
@@ -87,13 +273,24 @@ def build_umpire_standings(umpire_stats: dict[str, dict]) -> tuple[UmpireStandin
                 total=total,
                 confirmed=confirmed,
                 overturned=overturned,
-                upheld_rate=(confirmed / total) if total else 0.0,
+                upheld_rate=float(components["raw_rate"]),
+                bayes_rate=float(components["bayes_rate"]),
+                wilson=float(components["wilson"]),
+                sample_factor=float(components["sample_factor"]),
+                recent_confirmed=recent_confirmed if include_momentum else 0,
+                recent_overturned=recent_overturned if include_momentum else 0,
+                momentum=float(components["momentum"]) if include_momentum else 0.0,
+                difficulty_avg=difficulty_avg,
+                difficulty_bonus=float(components["difficulty_bonus"]),
+                abs_power_score=float(components["abs_power_score"]),
             )
         )
 
     standings.sort(
         key=lambda standing: (
-            -standing.upheld_rate,
+            -standing.abs_power_score,
+            -standing.bayes_rate,
+            -standing.wilson,
             -standing.total,
             standing.name.lower(),
         )
@@ -104,12 +301,21 @@ def build_umpire_standings(umpire_stats: dict[str, dict]) -> tuple[UmpireStandin
 def build_weekly_leaderboard(
     *,
     umpire_stats: dict[str, dict],
+    challenge_history: Iterable[dict[str, Any]] = (),
     week_start: date,
     week_end: date,
 ) -> UmpireLeaderboard:
-    standings = build_umpire_standings(umpire_stats)
+    standings = build_umpire_standings(
+        umpire_stats,
+        challenge_history=challenge_history,
+        as_of=week_end,
+        include_momentum=True,
+    )
     title = f"Weekly ABS Umpire Leaderboard (Thru {week_end.strftime('%b %d')})"
-    subtitle = f"Season-to-date HP umpire ABS upheld rate through {week_end.strftime('%b %d, %Y')}"
+    subtitle = (
+        f"Season-to-date HP umpire power ranking through {week_end.strftime('%b %d, %Y')} | "
+        "Sorted by ABS Power Score"
+    )
     leaderboard_id = f"leaderboard:weekly:{week_end.isoformat()}"
     return UmpireLeaderboard(
         leaderboard_id=leaderboard_id,
@@ -117,17 +323,25 @@ def build_weekly_leaderboard(
         title=title,
         subtitle=subtitle,
         standings=standings,
+        league_average=_league_average(umpire_stats),
     )
 
 
 def build_season_champion_leaderboard(
     *,
     umpire_stats: dict[str, dict],
+    challenge_history: Iterable[dict[str, Any]] = (),
     season_year: int,
+    as_of: date | None = None,
 ) -> UmpireLeaderboard:
-    standings = build_umpire_standings(umpire_stats)
+    standings = build_umpire_standings(
+        umpire_stats,
+        challenge_history=challenge_history,
+        as_of=as_of,
+        include_momentum=False,
+    )
     title = f"ABS Regular Season Champion ({season_year})"
-    subtitle = "Final upheld-rate standings"
+    subtitle = "Final season-to-date power ranking | Sorted by ABS Power Score"
     leaderboard_id = f"leaderboard:season:{season_year}"
     return UmpireLeaderboard(
         leaderboard_id=leaderboard_id,
@@ -135,6 +349,7 @@ def build_season_champion_leaderboard(
         title=title,
         subtitle=subtitle,
         standings=standings,
+        league_average=_league_average(umpire_stats),
     )
 
 
@@ -159,9 +374,9 @@ def format_leaderboard_post_text(leaderboard: UmpireLeaderboard, *, limit: int =
     if most_challenged is not None:
         blocks.append(
             [
-            f"Most challenged: {_truncate_name(most_challenged.name, 18)} - "
-            f"{most_challenged.upheld_percent:.1f}% "
-            f"({most_challenged.record_display}, {most_challenged.total})"
+                f"Most challenged: {_truncate_name(most_challenged.name, 18)} - "
+                f"{most_challenged.upheld_percent:.1f}% "
+                f"({most_challenged.record_display}, {most_challenged.total})"
             ]
         )
     return _truncate_blocks(blocks, limit)
@@ -180,7 +395,10 @@ def format_leaderboard_alt_text(leaderboard: UmpireLeaderboard) -> str:
             f"at {most_challenged.upheld_percent:.1f}% on {most_challenged.total} challenges."
         )
     if top_three:
-        return f"{leaderboard.title}. {leaderboard.subtitle}. Top three: {top_three}.{most_challenged_text}"
+        return (
+            f"{leaderboard.title}. {leaderboard.subtitle}. "
+            f"Top three: {top_three}.{most_challenged_text}"
+        )
     return f"{leaderboard.title}. {leaderboard.subtitle}.{most_challenged_text}"
 
 
@@ -202,8 +420,8 @@ def render_umpire_leaderboard(leaderboard: UmpireLeaderboard, output_dir: Path) 
     title_font = _load_font(44, bold=True)
     subtitle_font = _load_font(24)
     card_label_font = _load_font(18, bold=True)
-    card_body_font = _load_font(28, bold=True)
-    card_small_font = _load_font(20)
+    card_body_font = _load_font(24, bold=True)
+    card_small_font = _load_font(19, bold=True)
     header_font = _load_font(24, bold=True)
     body_font = _load_font(23, bold=True)
 
@@ -222,22 +440,19 @@ def render_umpire_leaderboard(leaderboard: UmpireLeaderboard, output_dir: Path) 
     draw.text((OUTER_MARGIN + 54, 72), leaderboard.title, fill="#ffffff", font=title_font)
     draw.text((OUTER_MARGIN + 54, 122), leaderboard.subtitle, fill=CARD_MUTED, font=subtitle_font)
 
-    leader = leaderboard.standings[0] if leaderboard.standings else None
-    most_challenged = _most_challenged_standing(leaderboard.standings)
     _draw_summary_cards(
         draw,
-        leader=leader,
-        most_challenged=most_challenged,
+        standings=leaderboard.standings,
         label_font=card_label_font,
         body_font=card_body_font,
         small_font=card_small_font,
     )
 
-    left_rows = leaderboard.standings[:rows_per_column]
-    right_rows = leaderboard.standings[rows_per_column:]
+    left_rows, right_rows = _split_standings_columns(leaderboard.standings)
     column_width = (TABLE_RIGHT - TABLE_LEFT - COLUMN_GAP) / 2.0
     left_column_x = TABLE_LEFT
     right_column_x = TABLE_LEFT + column_width + COLUMN_GAP
+    most_challenged = _most_challenged_standing(leaderboard.standings)
 
     _draw_table_column(
         draw,
@@ -258,7 +473,7 @@ def render_umpire_leaderboard(leaderboard: UmpireLeaderboard, output_dir: Path) 
         column_top=TABLE_TOP,
         column_width=column_width,
         standings=right_rows,
-        rank_offset=rows_per_column,
+        rank_offset=len(left_rows),
         most_challenged_key=most_challenged.key if most_challenged else None,
     )
 
@@ -269,53 +484,22 @@ def render_umpire_leaderboard(leaderboard: UmpireLeaderboard, output_dir: Path) 
 def _draw_summary_cards(
     draw: "ImageDraw.ImageDraw",
     *,
-    leader: UmpireStanding | None,
-    most_challenged: UmpireStanding | None,
+    standings: tuple[UmpireStanding, ...],
     label_font,
     body_font,
     small_font,
 ) -> None:
-    card_width = (LEADERBOARD_WIDTH - (OUTER_MARGIN * 2) - 52 - (SUMMARY_CARD_GAP * 2)) / 3.0
-    card_lefts = [
-        OUTER_MARGIN + 26,
-        OUTER_MARGIN + 26 + card_width + SUMMARY_CARD_GAP,
-        OUTER_MARGIN + 26 + ((card_width + SUMMARY_CARD_GAP) * 2),
-    ]
     cards = [
-        (
-            "CURRENT LEADER",
-            (
-                leader.name if leader else "No data yet",
-                f"{leader.upheld_percent:.1f}% upheld" if leader else "",
-                f"Record {leader.record_display} on {leader.total} challenges" if leader else "",
-            ),
-            SUMMARY_CARD_BG,
-        ),
-        (
-            "LARGEST SAMPLE",
-            (
-                most_challenged.name if most_challenged else "No data yet",
-                f"{most_challenged.upheld_percent:.1f}% upheld" if most_challenged else "",
-                (
-                    f"Record {most_challenged.record_display} on {most_challenged.total} challenges"
-                    if most_challenged
-                    else ""
-                ),
-            ),
-            TABLE_MOST_CHALLENGED,
-        ),
-        (
-            "HOW TO READ THIS",
-            (
-                "Season-to-date standings",
-                "Total challenges = sample size",
-                "Small samples can swing fast",
-            ),
-            SUMMARY_CARD_ALT,
-        ),
+        _best_all_around_card(standings),
+        _safest_leader_card(standings),
+        _hottest_ump_card(standings),
+        _workhorse_card(standings),
     ]
+    card_width = (
+        LEADERBOARD_WIDTH - (OUTER_MARGIN * 2) - 52 - (SUMMARY_CARD_GAP * (len(cards) - 1))
+    ) / float(len(cards))
     for index, (label, lines, fill) in enumerate(cards):
-        left = card_lefts[index]
+        left = OUTER_MARGIN + 26 + (index * (card_width + SUMMARY_CARD_GAP))
         right = left + card_width
         draw.rounded_rectangle(
             (left, SUMMARY_TOP, right, SUMMARY_TOP + SUMMARY_CARD_HEIGHT),
@@ -324,10 +508,78 @@ def _draw_summary_cards(
             outline=CARD_OUTLINE,
             width=2,
         )
-        draw.text((left + 24, SUMMARY_TOP + 18), label, fill=CARD_OUTLINE, font=label_font)
-        draw.text((left + 24, SUMMARY_TOP + 48), lines[0], fill=CARD_OUTLINE, font=body_font)
-        draw.text((left + 24, SUMMARY_TOP + 88), lines[1], fill=CARD_OUTLINE, font=small_font)
-        draw.text((left + 24, SUMMARY_TOP + 114), lines[2], fill=CARD_OUTLINE, font=small_font)
+        draw.text((left + 22, SUMMARY_TOP + 16), label, fill=CARD_OUTLINE, font=label_font)
+        draw.text((left + 22, SUMMARY_TOP + 46), lines[0], fill=CARD_OUTLINE, font=body_font)
+        draw.text((left + 22, SUMMARY_TOP + 86), lines[1], fill=CARD_OUTLINE, font=small_font)
+        draw.text((left + 22, SUMMARY_TOP + 114), lines[2], fill=CARD_OUTLINE, font=small_font)
+
+
+def _best_all_around_card(standings: tuple[UmpireStanding, ...]) -> tuple[str, tuple[str, str, str], str]:
+    leader = standings[0] if standings else None
+    if leader is None:
+        return ("BEST ALL-AROUND", ("No data yet", "", ""), SUMMARY_CARD_BG)
+    return (
+        "BEST ALL-AROUND",
+        (
+            leader.name,
+            f"Power {leader.abs_power_score:.1f} | Upheld {leader.upheld_percent:.1f}%",
+            f"Record {leader.record_display} on {leader.total} challenges",
+        ),
+        SUMMARY_CARD_BG,
+    )
+
+
+def _safest_leader_card(standings: tuple[UmpireStanding, ...]) -> tuple[str, tuple[str, str, str], str]:
+    safest = _safest_leader_standing(standings)
+    if safest is None:
+        return ("SAFEST LEADER", ("No data yet", "", ""), SUMMARY_CARD_ALT)
+    return (
+        "SAFEST LEADER",
+        (
+            safest.name,
+            f"Wilson floor {safest.wilson_percent:.1f}% | Bayes {safest.bayes_percent:.1f}%",
+            f"Record {safest.record_display} on {safest.total} challenges",
+        ),
+        SUMMARY_CARD_ALT,
+    )
+
+
+def _hottest_ump_card(standings: tuple[UmpireStanding, ...]) -> tuple[str, tuple[str, str, str], str]:
+    hottest = _hottest_ump_standing(standings)
+    if hottest is None:
+        return (
+            "HOTTEST UMP",
+            (
+                "Awaiting recent sample",
+                "Need 3 reviewed challenges in the last 14 days",
+                "Momentum stays neutral until then",
+            ),
+            SUMMARY_CARD_HOT,
+        )
+    return (
+        "HOTTEST UMP",
+        (
+            hottest.name,
+            f"Momentum {hottest.momentum_display} | Last 14d {hottest.recent_record_display}",
+            f"Season record {hottest.record_display} on {hottest.total} challenges",
+        ),
+        SUMMARY_CARD_HOT,
+    )
+
+
+def _workhorse_card(standings: tuple[UmpireStanding, ...]) -> tuple[str, tuple[str, str, str], str]:
+    workhorse = _most_challenged_standing(standings)
+    if workhorse is None:
+        return ("WORKHORSE", ("No data yet", "", ""), TABLE_MOST_CHALLENGED)
+    return (
+        "WORKHORSE",
+        (
+            workhorse.name,
+            f"Most challenged: {workhorse.total} | Record {workhorse.record_display}",
+            f"Upheld {workhorse.upheld_percent:.1f}% | Power {workhorse.abs_power_score:.1f}",
+        ),
+        TABLE_MOST_CHALLENGED,
+    )
 
 
 def _draw_table_column(
@@ -348,7 +600,13 @@ def _draw_table_column(
         radius=14,
         fill=CARD_OUTLINE,
     )
-    _draw_table_headers(draw, header_font, column_left=column_left, column_top=column_top, column_width=column_width)
+    _draw_table_headers(
+        draw,
+        header_font,
+        column_left=column_left,
+        column_top=column_top,
+        column_width=column_width,
+    )
 
     for index, standing in enumerate(standings, start=1):
         rank = rank_offset + index
@@ -414,6 +672,11 @@ def _column_positions(column_left: float, column_width: float) -> dict[str, floa
     }
 
 
+def _split_standings_columns(standings: tuple[UmpireStanding, ...]) -> tuple[tuple[UmpireStanding, ...], tuple[UmpireStanding, ...]]:
+    rows_per_column = max(1, ceil(len(standings) / 2))
+    return standings[:rows_per_column], standings[rows_per_column:]
+
+
 def _most_challenged_standing(standings: Iterable[UmpireStanding]) -> UmpireStanding | None:
     standings_list = list(standings)
     if not standings_list:
@@ -422,6 +685,105 @@ def _most_challenged_standing(standings: Iterable[UmpireStanding]) -> UmpireStan
         standings_list,
         key=lambda standing: (standing.total, standing.confirmed, standing.name.lower()),
     )
+
+
+def _safest_leader_standing(standings: Iterable[UmpireStanding]) -> UmpireStanding | None:
+    standings_list = list(standings)
+    if not standings_list:
+        return None
+    return max(
+        standings_list,
+        key=lambda standing: (standing.wilson, standing.bayes_rate, standing.total, standing.name.lower()),
+    )
+
+
+def _hottest_ump_standing(standings: Iterable[UmpireStanding]) -> UmpireStanding | None:
+    eligible = [standing for standing in standings if standing.recent_total >= 3]
+    if not eligible:
+        return None
+    hottest = max(
+        eligible,
+        key=lambda standing: (standing.momentum, standing.recent_total, standing.abs_power_score, standing.name.lower()),
+    )
+    if hottest.momentum <= 0:
+        return None
+    return hottest
+
+
+def _league_average(umpire_stats: dict[str, dict]) -> float:
+    total_confirmed = 0
+    total_challenges = 0
+    for value in umpire_stats.values():
+        if not isinstance(value, dict):
+            continue
+        total_confirmed += int(value.get("confirmed", 0) or 0)
+        total_challenges += int(value.get("total", 0) or 0)
+    if total_challenges <= 0:
+        return 0.0
+    return total_confirmed / total_challenges
+
+
+def _recent_stats_by_umpire(
+    challenge_history: Iterable[dict[str, Any]],
+    *,
+    as_of: date,
+) -> dict[str, dict[str, int]]:
+    window_start = as_of - timedelta(days=POWER_RECENT_DAYS - 1)
+    recent_stats: dict[str, dict[str, int]] = {}
+    for entry in challenge_history:
+        if not isinstance(entry, dict):
+            continue
+        umpire_key = str(entry.get("umpire_key", "")).strip()
+        if not umpire_key:
+            continue
+        occurred_on = _history_entry_date(entry.get("occurred_at"))
+        if occurred_on is None or occurred_on < window_start or occurred_on > as_of:
+            continue
+        bucket = recent_stats.setdefault(umpire_key, {"confirmed": 0, "overturned": 0})
+        bucket["confirmed"] += int(entry.get("confirmed", 0) or 0)
+        bucket["overturned"] += int(entry.get("overturned", 0) or 0)
+    return recent_stats
+
+
+def _difficulty_average_by_umpire(
+    challenge_history: Iterable[dict[str, Any]],
+) -> dict[str, float]:
+    totals: dict[str, float] = {}
+    counts: dict[str, int] = {}
+    for entry in challenge_history:
+        if not isinstance(entry, dict):
+            continue
+        umpire_key = str(entry.get("umpire_key", "")).strip()
+        if not umpire_key:
+            continue
+        difficulty = _coerce_optional_float(entry.get("difficulty"))
+        if difficulty is None:
+            continue
+        totals[umpire_key] = totals.get(umpire_key, 0.0) + difficulty
+        counts[umpire_key] = counts.get(umpire_key, 0) + 1
+    return {
+        key: (totals[key] / counts[key])
+        for key in totals.keys()
+        if counts.get(key, 0) > 0
+    }
+
+
+def _history_entry_date(raw_value: Any) -> date | None:
+    if not raw_value:
+        return None
+    try:
+        return datetime.fromisoformat(str(raw_value).replace("Z", "+00:00")).date()
+    except ValueError:
+        return None
+
+
+def _coerce_optional_float(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _truncate_name(name: str, limit: int) -> str:

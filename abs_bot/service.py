@@ -23,9 +23,10 @@ from .leaderboard import (
 from .mlb import MlbStatsApiClient
 from .publishers import Publisher
 from .render import render_challenge_card
+from .savant import SavantAbsClient, difficulty_from_savant_row, latest_game_date
 
 
-STATE_VERSION = 8
+STATE_VERSION = 9
 logger = logging.getLogger(__name__)
 
 
@@ -49,6 +50,7 @@ class AbsBotService:
         local_timezone: str = "America/New_York",
         weekly_summary_hour_local: int = 9,
         regular_season_lookahead_days: int = 120,
+        savant_sync_hour_local: int = 5,
     ) -> None:
         self.client = client
         self.publishers = publishers
@@ -67,6 +69,8 @@ class AbsBotService:
         self.local_timezone = local_timezone
         self.weekly_summary_hour_local = weekly_summary_hour_local
         self.regular_season_lookahead_days = regular_season_lookahead_days
+        self.savant_sync_hour_local = savant_sync_hour_local
+        self.savant_client = SavantAbsClient(timeout_seconds=max(20, client.timeout_seconds))
         self.stop_event = threading.Event()
         self.state_lock = threading.Lock()
         self.last_error: str | None = None
@@ -86,10 +90,15 @@ class AbsBotService:
         (
             self.seen_challenge_ids,
             self.umpire_stats,
+            self.challenge_history,
             self.publisher_delivery,
             self.pending_clip_lookups,
             self.seen_clip_urls,
             self.seen_summary_ids,
+            self.savant_challenges,
+            self.last_savant_sync_local_date,
+            self.last_savant_sync_at,
+            self.last_savant_data_through,
         ) = self._load_state()
         self.closed_game_pks: set[int] = set()
 
@@ -298,6 +307,7 @@ class AbsBotService:
                     logger.info("Terminal game %s closed for future polling", game_pk)
                     self.closed_game_pks.add(game_pk)
 
+        self._maybe_sync_savant(now=now)
         new_posts += self._maybe_publish_summaries(now=now)
 
         sleep_seconds, mode, wake_reason, next_game_at = self._next_sleep_plan(
@@ -354,10 +364,16 @@ class AbsBotService:
                 "next_game_at": self.next_game_at,
                 "seen_challenges": len(self.seen_challenge_ids),
                 "tracked_umpires": len(self.umpire_stats),
+                "challenge_history_count": len(self.challenge_history),
                 "pending_publisher_deliveries": len(self.publisher_delivery),
                 "pending_clip_lookups": len(self.pending_clip_lookups),
                 "seen_clip_urls": len(self.seen_clip_urls),
                 "seen_summary_ids": len(self.seen_summary_ids),
+                "savant_challenge_rows": len(self.savant_challenges),
+                "last_savant_sync_local_date": self.last_savant_sync_local_date,
+                "last_savant_sync_at": self.last_savant_sync_at,
+                "last_savant_data_through": self.last_savant_data_through,
+                "savant_sync_hour_local": self.savant_sync_hour_local,
                 "total_posts": self.total_posts,
                 "recent_posts": list(self.recent_posts),
                 "recent_failures": list(self.recent_failures),
@@ -386,6 +402,7 @@ class AbsBotService:
             if clip is not None and clip.direct_url:
                 self.seen_clip_urls[clip.direct_url] = challenge_id
             self._update_umpire_stats(challenge)
+            self._append_challenge_history(challenge)
             self.recent_posts.appendleft(
                 {
                     "challenge_id": challenge_id,
@@ -530,6 +547,99 @@ class AbsBotService:
         delivered = self.publisher_delivery.get(challenge_id, set())
         return all(publisher.delivery_key in delivered for publisher in self.publishers)
 
+    def _maybe_sync_savant(self, *, now: datetime) -> None:
+        local_now = now.astimezone(self.local_tz)
+        local_date_iso = local_now.date().isoformat()
+        bootstrap_needed = not self.savant_challenges
+        if not bootstrap_needed and self.last_savant_sync_local_date == local_date_iso:
+            logger.debug("Savant sync already completed for local date %s", local_date_iso)
+            return
+        if not bootstrap_needed and local_now.hour < self.savant_sync_hour_local:
+            logger.debug(
+                "Skipping Savant sync before local hour %s (local_now=%s)",
+                self.savant_sync_hour_local,
+                local_now,
+            )
+            return
+        try:
+            self._run_savant_sync(now=now)
+        except Exception as exc:
+            logger.exception("Savant sync failed: %s", exc)
+            with self.state_lock:
+                self.last_error = f"Savant sync failed: {exc}"
+
+    def _run_savant_sync(self, *, now: datetime) -> None:
+        local_now = now.astimezone(self.local_tz)
+        season_year = local_now.year
+        logger.info("Starting Savant sync for season %s", season_year)
+        savant_challenges = self.savant_client.fetch_season_team_summary_challenges(year=season_year)
+        known_play_ids = self._known_challenge_play_ids()
+        missing_games: dict[int, str] = {}
+        for play_id, row in savant_challenges.items():
+            if play_id in known_play_ids:
+                continue
+            game_pk = int(row.get("game_pk", 0) or 0)
+            if not game_pk:
+                continue
+            game_date = str(row.get("game_date", ""))
+            existing = missing_games.get(game_pk)
+            if existing is None or (game_date and game_date < existing):
+                missing_games[game_pk] = game_date
+        logger.info(
+            "Savant sync found %s season row(s), %s known play_id(s), %s missing game feed(s)",
+            len(savant_challenges),
+            len(known_play_ids),
+            len(missing_games),
+        )
+
+        backfill_challenges: list[Any] = []
+        for game_pk, _game_date in sorted(missing_games.items(), key=lambda item: (item[1], item[0])):
+            try:
+                logger.info("Backfilling Savant-linked challenges from MLB feed for game %s", game_pk)
+                feed = self.client.fetch_live_game_feed(game_pk)
+                extracted = extract_abs_challenges(feed)
+            except Exception as exc:
+                logger.exception("Failed to backfill MLB feed for game %s during Savant sync: %s", game_pk, exc)
+                continue
+            matched = [
+                challenge
+                for challenge in extracted
+                if getattr(challenge.pitch, "play_id", None) in savant_challenges
+            ]
+            logger.info(
+                "Game %s yielded %s ABS challenge(s), %s linked to Savant",
+                game_pk,
+                len(extracted),
+                len(matched),
+            )
+            backfill_challenges.extend(matched)
+
+        backfilled = 0
+        with self.state_lock:
+            self.savant_challenges = savant_challenges
+            for challenge in sorted(
+                backfill_challenges,
+                key=lambda item: getattr(item, "play_end_time", "") or "",
+            ):
+                play_id = getattr(challenge.pitch, "play_id", None)
+                if self._history_has_entry_unlocked(challenge.challenge_id, play_id):
+                    continue
+                challenge = self._challenge_with_umpire_stats(challenge)
+                self._update_umpire_stats(challenge)
+                self._append_challenge_history(challenge)
+                backfilled += 1
+            enriched = self._apply_savant_enrichment_unlocked()
+            self.last_savant_sync_local_date = local_now.date().isoformat()
+            self.last_savant_sync_at = now.isoformat()
+            self.last_savant_data_through = latest_game_date(self.savant_challenges)
+            self._save_state()
+        logger.info(
+            "Savant sync complete: backfilled=%s enriched=%s data_through=%s",
+            backfilled,
+            enriched,
+            self.last_savant_data_through,
+        )
+
     def _maybe_publish_summaries(self, *, now: datetime) -> int:
         published = 0
         published += self._maybe_publish_weekly_leaderboard(now=now)
@@ -564,8 +674,16 @@ class AbsBotService:
                 week_end,
             )
             return 0
+        if not self._savant_covers_date(week_end):
+            logger.info(
+                "Weekly leaderboard for %s is waiting on Savant data coverage (through=%s)",
+                week_end,
+                self.last_savant_data_through,
+            )
+            return 0
         leaderboard = build_weekly_leaderboard(
             umpire_stats=self._umpire_stats_snapshot(),
+            challenge_history=self._challenge_history_snapshot(),
             week_start=week_start,
             week_end=week_end,
         )
@@ -613,6 +731,14 @@ class AbsBotService:
             return None
         return game_time.astimezone(self.local_tz).date()
 
+    def _savant_covers_date(self, target_date: date) -> bool:
+        if not self.last_savant_data_through:
+            return False
+        try:
+            return date.fromisoformat(self.last_savant_data_through) >= target_date
+        except ValueError:
+            return False
+
     def _maybe_publish_season_champion(self, *, now: datetime) -> int:
         local_now = now.astimezone(self.local_tz)
         if local_now.month < 9:
@@ -625,7 +751,9 @@ class AbsBotService:
 
         leaderboard = build_season_champion_leaderboard(
             umpire_stats=self._umpire_stats_snapshot(),
+            challenge_history=self._challenge_history_snapshot(),
             season_year=local_now.year,
+            as_of=local_now.date(),
         )
         return self._publish_leaderboard(leaderboard)
 
@@ -766,30 +894,35 @@ class AbsBotService:
     ) -> tuple[
         set[str],
         dict[str, Dict[str, Any]],
+        list[Dict[str, Any]],
         dict[str, Set[str]],
         dict[str, Dict[str, Any]],
         dict[str, str],
         set[str],
+        dict[str, Dict[str, Any]],
+        str | None,
+        str | None,
+        str | None,
     ]:
         if not self.state_file.exists():
-            return set(), {}, {}, {}, {}, set()
+            return set(), {}, [], {}, {}, {}, set(), {}, None, None, None
         try:
             payload = json.loads(self.state_file.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
-            return set(), {}, {}, {}, {}, set()
+            return set(), {}, [], {}, {}, {}, set(), {}, None, None, None
         if isinstance(payload, list):
-            return {str(item) for item in payload}, {}, {}, {}, {}, set()
+            return {str(item) for item in payload}, {}, [], {}, {}, {}, set(), {}, None, None, None
         if not isinstance(payload, dict):
-            return set(), {}, {}, {}, {}, set()
+            return set(), {}, [], {}, {}, {}, set(), {}, None, None, None
 
         payload_version = int(payload.get("state_version", 0) or 0)
         seen_ids: set[str] = set()
-        if payload_version == STATE_VERSION:
-            seen_payload = payload.get("seen_challenge_ids", [])
+        seen_payload = payload.get("seen_challenge_ids", [])
+        if isinstance(seen_payload, list):
             seen_ids = {str(item) for item in seen_payload if item is not None}
         umpire_stats: dict[str, Dict[str, Any]] = {}
         umpire_payload = payload.get("umpire_stats", {})
-        if payload_version == STATE_VERSION and isinstance(umpire_payload, dict):
+        if isinstance(umpire_payload, dict):
             for key, value in umpire_payload.items():
                 if not isinstance(value, dict):
                     continue
@@ -798,10 +931,35 @@ class AbsBotService:
                     "total": int(value.get("total", 0) or 0),
                     "confirmed": int(value.get("confirmed", 0) or 0),
                     "overturned": int(value.get("overturned", 0) or 0),
+                    "difficulty_avg": value.get("difficulty_avg"),
                 }
+        challenge_history: list[Dict[str, Any]] = []
+        challenge_history_payload = payload.get("challenge_history", [])
+        if isinstance(challenge_history_payload, list):
+            for entry in challenge_history_payload:
+                if not isinstance(entry, dict):
+                    continue
+                challenge_history.append(
+                    {
+                        "challenge_id": str(entry.get("challenge_id", "")),
+                        "play_id": str(entry.get("play_id", "")),
+                        "game_pk": int(entry.get("game_pk", 0) or 0),
+                        "umpire_key": str(entry.get("umpire_key", "")),
+                        "occurred_at": str(entry.get("occurred_at", "")),
+                        "confirmed": int(entry.get("confirmed", 0) or 0),
+                        "overturned": int(entry.get("overturned", 0) or 0),
+                        "difficulty": entry.get("difficulty"),
+                        "challenge_probability": entry.get("challenge_probability"),
+                        "edge_distance_inches": entry.get("edge_distance_inches"),
+                        "challenge_runs": entry.get("challenge_runs"),
+                        "challenge_overturned_runs": entry.get("challenge_overturned_runs"),
+                        "challenge_lost_runs": entry.get("challenge_lost_runs"),
+                        "reasonable_attempt": entry.get("reasonable_attempt"),
+                    }
+                )
         publisher_delivery: dict[str, Set[str]] = {}
         delivery_payload = payload.get("publisher_delivery", {})
-        if payload_version == STATE_VERSION and isinstance(delivery_payload, dict):
+        if isinstance(delivery_payload, dict):
             for key, value in delivery_payload.items():
                 if isinstance(value, list):
                     publisher_delivery[str(key)] = {
@@ -811,7 +969,7 @@ class AbsBotService:
                     }
         pending_clip_lookups: dict[str, Dict[str, Any]] = {}
         pending_payload = payload.get("pending_clip_lookups", {})
-        if payload_version == STATE_VERSION and isinstance(pending_payload, dict):
+        if isinstance(pending_payload, dict):
             for key, value in pending_payload.items():
                 if not isinstance(value, dict):
                     continue
@@ -824,16 +982,47 @@ class AbsBotService:
                 }
         seen_clip_urls: dict[str, str] = {}
         seen_clip_payload = payload.get("seen_clip_urls", {})
-        if payload_version == STATE_VERSION and isinstance(seen_clip_payload, dict):
+        if isinstance(seen_clip_payload, dict):
             for clip_url, challenge_id in seen_clip_payload.items():
                 if not clip_url or not challenge_id:
                     continue
                 seen_clip_urls[str(clip_url)] = str(challenge_id)
         seen_summary_ids: set[str] = set()
         seen_summary_payload = payload.get("seen_summary_ids", [])
-        if payload_version == STATE_VERSION and isinstance(seen_summary_payload, list):
+        if isinstance(seen_summary_payload, list):
             seen_summary_ids = {str(item) for item in seen_summary_payload if item is not None}
-        return seen_ids, umpire_stats, publisher_delivery, pending_clip_lookups, seen_clip_urls, seen_summary_ids
+        savant_challenges: dict[str, Dict[str, Any]] = {}
+        savant_payload = payload.get("savant_challenges", {})
+        if isinstance(savant_payload, dict):
+            for play_id, row in savant_payload.items():
+                if not play_id or not isinstance(row, dict):
+                    continue
+                savant_challenges[str(play_id)] = dict(row)
+        last_savant_sync_local_date = None
+        raw_sync_local_date = payload.get("last_savant_sync_local_date")
+        if raw_sync_local_date:
+            last_savant_sync_local_date = str(raw_sync_local_date)
+        last_savant_sync_at = None
+        raw_sync_at = payload.get("last_savant_sync_at")
+        if raw_sync_at:
+            last_savant_sync_at = str(raw_sync_at)
+        last_savant_data_through = None
+        raw_data_through = payload.get("last_savant_data_through")
+        if raw_data_through:
+            last_savant_data_through = str(raw_data_through)
+        return (
+            seen_ids,
+            umpire_stats,
+            challenge_history,
+            publisher_delivery,
+            pending_clip_lookups,
+            seen_clip_urls,
+            seen_summary_ids,
+            savant_challenges,
+            last_savant_sync_local_date,
+            last_savant_sync_at,
+            last_savant_data_through,
+        )
 
     def _save_state(self) -> None:
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
@@ -843,6 +1032,7 @@ class AbsBotService:
                     "state_version": STATE_VERSION,
                     "seen_challenge_ids": sorted(self.seen_challenge_ids),
                     "umpire_stats": self.umpire_stats,
+                    "challenge_history": self.challenge_history,
                     "publisher_delivery": {
                         key: sorted(value)
                         for key, value in self.publisher_delivery.items()
@@ -850,6 +1040,10 @@ class AbsBotService:
                     "pending_clip_lookups": self.pending_clip_lookups,
                     "seen_clip_urls": self.seen_clip_urls,
                     "seen_summary_ids": sorted(self.seen_summary_ids),
+                    "savant_challenges": self.savant_challenges,
+                    "last_savant_sync_local_date": self.last_savant_sync_local_date,
+                    "last_savant_sync_at": self.last_savant_sync_at,
+                    "last_savant_data_through": self.last_savant_data_through,
                 },
                 indent=2,
             ),
@@ -870,6 +1064,79 @@ class AbsBotService:
                 key: dict(value)
                 for key, value in self.umpire_stats.items()
             }
+
+    def _challenge_history_snapshot(self) -> list[Dict[str, Any]]:
+        with self.state_lock:
+            return [dict(entry) for entry in self.challenge_history]
+
+    def _known_challenge_play_ids(self) -> set[str]:
+        with self.state_lock:
+            return {
+                play_id
+                for play_id in (
+                    _history_play_id(entry)
+                    for entry in self.challenge_history
+                )
+                if play_id
+            }
+
+    def _history_has_entry_unlocked(self, challenge_id: str, play_id: str | None) -> bool:
+        for entry in self.challenge_history:
+            if challenge_id and str(entry.get("challenge_id", "")) == challenge_id:
+                return True
+            if play_id and _history_play_id(entry) == play_id:
+                return True
+        return False
+
+    def _apply_savant_enrichment_unlocked(self) -> int:
+        changed = 0
+        for entry in self.challenge_history:
+            play_id = _history_play_id(entry)
+            if play_id and entry.get("play_id") != play_id:
+                entry["play_id"] = play_id
+                changed += 1
+            if not play_id:
+                continue
+            savant_row = self.savant_challenges.get(play_id)
+            if not savant_row:
+                continue
+            updates = {
+                "game_pk": int(entry.get("game_pk", 0) or 0) or int(savant_row.get("game_pk", 0) or 0),
+                "challenge_probability": savant_row.get("challenge_probability"),
+                "edge_distance_inches": savant_row.get("edge_distance_inches"),
+                "challenge_runs": savant_row.get("challenge_runs"),
+                "challenge_overturned_runs": savant_row.get("challenge_overturned_runs"),
+                "challenge_lost_runs": savant_row.get("challenge_lost_runs"),
+                "reasonable_attempt": savant_row.get("reasonable_attempt"),
+                "difficulty": difficulty_from_savant_row(
+                    savant_row,
+                    confirmed=bool(int(entry.get("confirmed", 0) or 0)),
+                ),
+            }
+            if not entry.get("occurred_at") and savant_row.get("game_date_raw"):
+                updates["occurred_at"] = savant_row.get("game_date_raw")
+            for key, value in updates.items():
+                if entry.get(key) != value:
+                    entry[key] = value
+                    changed += 1
+        self._refresh_umpire_difficulty_averages_unlocked()
+        return changed
+
+    def _refresh_umpire_difficulty_averages_unlocked(self) -> None:
+        totals: dict[str, float] = {}
+        counts: dict[str, int] = {}
+        for entry in self.challenge_history:
+            umpire_key = str(entry.get("umpire_key", "")).strip()
+            difficulty = _coerce_optional_float(entry.get("difficulty"))
+            if not umpire_key or difficulty is None:
+                continue
+            totals[umpire_key] = totals.get(umpire_key, 0.0) + difficulty
+            counts[umpire_key] = counts.get(umpire_key, 0) + 1
+        for key, stats in self.umpire_stats.items():
+            if key in counts and counts[key] > 0:
+                stats["difficulty_avg"] = totals[key] / counts[key]
+            else:
+                stats["difficulty_avg"] = None
 
     def _challenge_with_umpire_stats(self, challenge: Any) -> Any:
         key = self._umpire_state_key(challenge)
@@ -906,12 +1173,49 @@ class AbsBotService:
         key = self._umpire_state_key(challenge)
         if not key:
             return
+        existing = self.umpire_stats.get(key, {})
         self.umpire_stats[key] = {
             "name": challenge.home_plate_umpire_name,
             "total": int(challenge.umpire_challenge_total or 0),
             "confirmed": int(challenge.umpire_confirmed_total or 0),
             "overturned": int(challenge.umpire_overturned_total or 0),
+            "difficulty_avg": existing.get("difficulty_avg"),
         }
+
+    def _append_challenge_history(self, challenge: Any) -> None:
+        key = self._umpire_state_key(challenge)
+        if not key:
+            return
+        challenge_id = getattr(challenge, "challenge_id", "")
+        play_id = getattr(getattr(challenge, "pitch", None), "play_id", None)
+        if self._history_has_entry_unlocked(challenge_id, play_id):
+            return
+        savant_row = self.savant_challenges.get(str(play_id or "")) if play_id else None
+        confirmed = 0 if getattr(challenge, "is_overturned", False) else 1
+        self.challenge_history.append(
+            {
+                "challenge_id": challenge_id,
+                "play_id": str(play_id or ""),
+                "game_pk": int(getattr(challenge, "game_pk", 0) or 0),
+                "umpire_key": key,
+                "occurred_at": getattr(challenge, "play_end_time", None) or _utc_now_iso(),
+                "confirmed": confirmed,
+                "overturned": 1 if getattr(challenge, "is_overturned", False) else 0,
+                "difficulty": (
+                    difficulty_from_savant_row(savant_row, confirmed=bool(confirmed))
+                    if savant_row
+                    else None
+                ),
+                "challenge_probability": savant_row.get("challenge_probability") if savant_row else None,
+                "edge_distance_inches": savant_row.get("edge_distance_inches") if savant_row else None,
+                "challenge_runs": savant_row.get("challenge_runs") if savant_row else None,
+                "challenge_overturned_runs": (
+                    savant_row.get("challenge_overturned_runs") if savant_row else None
+                ),
+                "challenge_lost_runs": savant_row.get("challenge_lost_runs") if savant_row else None,
+                "reasonable_attempt": savant_row.get("reasonable_attempt") if savant_row else None,
+            }
+        )
 
     @staticmethod
     def _umpire_state_key(challenge: Any) -> str | None:
@@ -998,6 +1302,28 @@ def _parse_iso(value: Any) -> datetime | None:
         return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(timezone.utc)
     except ValueError:
         return None
+
+
+def _coerce_optional_float(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _history_play_id(entry: Dict[str, Any]) -> str:
+    play_id = str(entry.get("play_id", "")).strip()
+    if play_id:
+        return play_id
+    challenge_id = str(entry.get("challenge_id", "")).strip()
+    if not challenge_id:
+        return ""
+    parts = challenge_id.split(":")
+    if len(parts) >= 3 and "-" in parts[2]:
+        return parts[2].strip()
+    return ""
 
 
 def _game_time_iso(client: MlbStatsApiClient, game: Dict[str, Any] | None) -> str | None:
