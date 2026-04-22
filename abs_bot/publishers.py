@@ -30,6 +30,10 @@ from .models import AbsChallenge
 
 logger = logging.getLogger(__name__)
 
+BLUESKY_DEFAULT_TIMEOUT = 60
+BLUESKY_UPLOAD_TIMEOUT = 180
+BLUESKY_VIDEO_MIME_TYPE = "video/mp4"
+
 
 class Publisher:
     @property
@@ -187,25 +191,25 @@ class BlueSkyPublisher(Publisher):
             try:
                 session = _create_bluesky_session(self.handle, self.app_password)
                 try:
-                    video_blob = _upload_bluesky_native_video(session, clip_path)
-                except Exception as native_exc:
+                    video_blob = _upload_bluesky_video_blob(session, clip_path)
+                except Exception as blob_exc:
                     logger.warning(
-                        "BlueSky video service upload failed for challenge %s, trying uploadBlob fallback: %s",
+                        "BlueSky uploadBlob failed for challenge %s, trying video service fallback: %s",
                         challenge.challenge_id,
-                        native_exc,
+                        blob_exc,
                     )
                     try:
-                        video_blob = _upload_bluesky_video_blob(session, clip_path)
-                    except Exception as blob_exc:
+                        video_blob = _upload_bluesky_native_video(session, clip_path)
+                    except Exception as native_exc:
                         raise RuntimeError(
-                            "BlueSky native video upload failed via both the video service "
-                            f"and direct uploadBlob fallback. Service error: {native_exc}; "
-                            f"uploadBlob error: {blob_exc}"
-                        ) from blob_exc
+                            "BlueSky native video upload failed via both direct uploadBlob "
+                            f"and the video service fallback. uploadBlob error: {blob_exc}; "
+                            f"service error: {native_exc}"
+                        ) from native_exc
                 _create_bluesky_video_post(
                     session=session,
                     text=format_bluesky_clip_embed_text(challenge),
-                    video_blob=video_blob,
+                    video_blob=_normalize_bluesky_video_blob(video_blob, clip_path=clip_path),
                     alt_text=format_clip_alt_text(challenge),
                     aspect_ratio=_clip_aspect_ratio(clip),
                 )
@@ -478,7 +482,7 @@ def _download_clip_to_temp(clip_url: str) -> Path:
             clip_url,
             headers={"User-Agent": "mlb-abs-bot/0.1"},
         )
-        with urlopen(request, timeout=60) as response:
+        with urlopen(request, timeout=BLUESKY_UPLOAD_TIMEOUT) as response:
             while True:
                 chunk = response.read(1024 * 1024)
                 if not chunk:
@@ -562,14 +566,18 @@ def _upload_bluesky_native_video(session: dict, clip_path: Path) -> dict:
         data=clip_path.read_bytes(),
         headers={
             "Authorization": f"Bearer {service_token}",
-            "Content-Type": "video/mp4",
+            "Content-Type": BLUESKY_VIDEO_MIME_TYPE,
             "Content-Length": str(clip_path.stat().st_size),
             "Connection": "close",
             "User-Agent": "mlb-abs-bot/0.1",
         },
         method="POST",
     )
-    payload = _read_json_response(request, allow_error_json=True)
+    payload = _read_json_response(
+        request,
+        allow_error_json=True,
+        timeout=BLUESKY_UPLOAD_TIMEOUT,
+    )
     job_status = _extract_bluesky_job_status(payload)
     blob = _extract_bluesky_blob(job_status)
     if blob is not None:
@@ -586,7 +594,11 @@ def _upload_bluesky_native_video(session: dict, clip_path: Path) -> dict:
             headers={"User-Agent": "mlb-abs-bot/0.1"},
             method="GET",
         )
-        status_payload = _read_json_response(status_request, allow_error_json=True)
+        status_payload = _read_json_response(
+            status_request,
+            allow_error_json=True,
+            timeout=BLUESKY_DEFAULT_TIMEOUT,
+        )
         status = _extract_bluesky_job_status(status_payload)
         blob = _extract_bluesky_blob(status)
         if blob is not None:
@@ -611,14 +623,14 @@ def _upload_bluesky_video_blob(session: dict, clip_path: Path) -> dict:
         data=clip_path.read_bytes(),
         headers={
             "Authorization": f"Bearer {session['accessJwt']}",
-            "Content-Type": "video/mp4",
+            "Content-Type": BLUESKY_VIDEO_MIME_TYPE,
             "Content-Length": str(clip_path.stat().st_size),
             "Connection": "close",
             "User-Agent": "mlb-abs-bot/0.1",
         },
         method="POST",
     )
-    payload = _read_json_response(request)
+    payload = _read_json_response(request, timeout=BLUESKY_UPLOAD_TIMEOUT)
     blob = payload.get("blob")
     if not isinstance(blob, dict):
         raise RuntimeError("BlueSky uploadBlob response did not include a blob.")
@@ -682,7 +694,7 @@ def _create_bluesky_video_post(
         },
         method="POST",
     )
-    _read_json_response(request)
+    _read_json_response(request, timeout=BLUESKY_DEFAULT_TIMEOUT)
 
 
 def _publish_bluesky_external_clip(client: object, challenge: AbsChallenge, clip: ClipMedia) -> None:
@@ -733,9 +745,26 @@ def _extract_bluesky_blob(payload: dict) -> dict | None:
     return None
 
 
-def _read_json_response(request: Request, *, allow_error_json: bool = False) -> dict:
+def _normalize_bluesky_video_blob(video_blob: dict, *, clip_path: Path) -> dict:
+    normalized = dict(video_blob)
+    mime_type = str(normalized.get("mimeType") or "").strip().lower()
+    if clip_path.suffix.lower() == ".mp4" or mime_type in {
+        "video/x-m4v",
+        "application/mp4",
+        "video/mp4v-es",
+    }:
+        normalized["mimeType"] = BLUESKY_VIDEO_MIME_TYPE
+    return normalized
+
+
+def _read_json_response(
+    request: Request,
+    *,
+    allow_error_json: bool = False,
+    timeout: int = BLUESKY_DEFAULT_TIMEOUT,
+) -> dict:
     try:
-        with urlopen(request, timeout=60) as response:
+        with urlopen(request, timeout=timeout) as response:
             return json.loads(response.read().decode("utf-8"))
     except HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
