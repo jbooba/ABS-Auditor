@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Deque, Dict, List, Set
 from zoneinfo import ZoneInfo
 
-from .challenges import extract_abs_challenges, format_post_text
+from .challenges import extract_abs_challenges, extract_home_plate_umpire, format_post_text
 from .clips import ClipMedia, ClipLookupResult, lookup_abs_clip_options
 from .leaderboard import (
     UmpireLeaderboard,
@@ -91,11 +91,14 @@ class AbsBotService:
             self.seen_challenge_ids,
             self.umpire_stats,
             self.challenge_history,
+            self.home_plate_games,
             self.publisher_delivery,
             self.pending_clip_lookups,
             self.seen_clip_urls,
             self.seen_summary_ids,
             self.savant_challenges,
+            self.last_home_plate_games_sync_local_date,
+            self.last_home_plate_games_sync_at,
             self.last_savant_sync_local_date,
             self.last_savant_sync_at,
             self.last_savant_data_through,
@@ -184,6 +187,7 @@ class AbsBotService:
                 self.client.detailed_state(game),
             )
             feed = self.client.fetch_live_game_feed(game_pk)
+            self._record_home_plate_assignment_from_feed(game=game, feed=feed)
             game_has_pending_delivery = False
             challenges = extract_abs_challenges(feed)
             logger.info("Game %s produced %s ABS challenge candidate(s)", game_pk, len(challenges))
@@ -307,6 +311,7 @@ class AbsBotService:
                     logger.info("Terminal game %s closed for future polling", game_pk)
                     self.closed_game_pks.add(game_pk)
 
+        self._maybe_sync_home_plate_games(now=now)
         self._maybe_sync_savant(now=now)
         new_posts += self._maybe_publish_summaries(now=now)
 
@@ -365,11 +370,14 @@ class AbsBotService:
                 "seen_challenges": len(self.seen_challenge_ids),
                 "tracked_umpires": len(self.umpire_stats),
                 "challenge_history_count": len(self.challenge_history),
+                "home_plate_game_count": len(self.home_plate_games),
                 "pending_publisher_deliveries": len(self.publisher_delivery),
                 "pending_clip_lookups": len(self.pending_clip_lookups),
                 "seen_clip_urls": len(self.seen_clip_urls),
                 "seen_summary_ids": len(self.seen_summary_ids),
                 "savant_challenge_rows": len(self.savant_challenges),
+                "last_home_plate_games_sync_local_date": self.last_home_plate_games_sync_local_date,
+                "last_home_plate_games_sync_at": self.last_home_plate_games_sync_at,
                 "last_savant_sync_local_date": self.last_savant_sync_local_date,
                 "last_savant_sync_at": self.last_savant_sync_at,
                 "last_savant_data_through": self.last_savant_data_through,
@@ -547,6 +555,90 @@ class AbsBotService:
         delivered = self.publisher_delivery.get(challenge_id, set())
         return all(publisher.delivery_key in delivered for publisher in self.publishers)
 
+    def _maybe_sync_home_plate_games(self, *, now: datetime) -> None:
+        local_now = now.astimezone(self.local_tz)
+        local_date_iso = local_now.date().isoformat()
+        bootstrap_needed = not self.home_plate_games
+        if not bootstrap_needed and self.last_home_plate_games_sync_local_date == local_date_iso:
+            logger.debug("Home plate game sync already completed for local date %s", local_date_iso)
+            return
+        if not bootstrap_needed and local_now.hour < self.savant_sync_hour_local:
+            logger.debug(
+                "Skipping home plate game sync before local hour %s (local_now=%s)",
+                self.savant_sync_hour_local,
+                local_now,
+            )
+            return
+        try:
+            self._run_home_plate_games_sync(now=now)
+        except Exception as exc:
+            logger.exception("Home plate game sync failed: %s", exc)
+            with self.state_lock:
+                self.last_error = f"Home plate game sync failed: {exc}"
+
+    def _run_home_plate_games_sync(self, *, now: datetime) -> None:
+        local_now = now.astimezone(self.local_tz)
+        season_start = date(local_now.year, 1, 1).isoformat()
+        season_end = local_now.date().isoformat()
+        season_games = [
+            game
+            for game in self.client.schedule_for_range(season_start, season_end)
+            if self.client.game_type(game) == "R" and self.client.should_track_game(game)
+        ]
+        eligible_games = [
+            game
+            for game in season_games
+            if (self.client.game_datetime_utc(game) or now) <= now
+        ]
+        with self.state_lock:
+            known_game_pks = set(self.home_plate_games.keys())
+        missing_games = [
+            game
+            for game in eligible_games
+            if str(int(game.get("gamePk", 0) or 0)) not in known_game_pks
+        ]
+        logger.info(
+            "Starting home plate game sync: season_games=%s eligible=%s missing=%s",
+            len(season_games),
+            len(eligible_games),
+            len(missing_games),
+        )
+
+        pending_assignments: dict[str, Dict[str, Any]] = {}
+        for game in sorted(
+            missing_games,
+            key=lambda item: self.client.game_datetime_utc(item) or datetime.max.replace(tzinfo=timezone.utc),
+        ):
+            game_pk = int(game.get("gamePk", 0) or 0)
+            if not game_pk:
+                continue
+            try:
+                logger.info("Fetching game %s for home plate assignment sync", game_pk)
+                feed = self.client.fetch_live_game_feed(game_pk)
+            except Exception as exc:
+                logger.exception("Failed to fetch game %s for home plate sync: %s", game_pk, exc)
+                continue
+            assignment = self._build_home_plate_assignment(game=game, feed=feed)
+            if assignment is None:
+                logger.info("Game %s did not expose a home plate umpire yet", game_pk)
+                continue
+            assignment_key, assignment_value = assignment
+            pending_assignments[assignment_key] = assignment_value
+
+        changed = 0
+        with self.state_lock:
+            for assignment_key, assignment_value in pending_assignments.items():
+                if self._store_home_plate_assignment_unlocked(assignment_key, assignment_value):
+                    changed += 1
+            self.last_home_plate_games_sync_local_date = local_now.date().isoformat()
+            self.last_home_plate_games_sync_at = now.isoformat()
+            self._save_state()
+        logger.info(
+            "Home plate game sync complete: added_or_updated=%s total_assignments=%s",
+            changed,
+            len(self.home_plate_games),
+        )
+
     def _maybe_sync_savant(self, *, now: datetime) -> None:
         local_now = now.astimezone(self.local_tz)
         local_date_iso = local_now.date().isoformat()
@@ -597,6 +689,11 @@ class AbsBotService:
             try:
                 logger.info("Backfilling Savant-linked challenges from MLB feed for game %s", game_pk)
                 feed = self.client.fetch_live_game_feed(game_pk)
+                self._record_home_plate_assignment_from_feed(
+                    game=None,
+                    feed=feed,
+                    fallback_game_date=_game_date,
+                )
                 extracted = extract_abs_challenges(feed)
             except Exception as exc:
                 logger.exception("Failed to backfill MLB feed for game %s during Savant sync: %s", game_pk, exc)
@@ -684,6 +781,7 @@ class AbsBotService:
         leaderboard = build_weekly_leaderboard(
             umpire_stats=self._umpire_stats_snapshot(),
             challenge_history=self._challenge_history_snapshot(),
+            home_plate_assignments=self._home_plate_games_snapshot(),
             week_start=week_start,
             week_end=week_end,
         )
@@ -752,6 +850,7 @@ class AbsBotService:
         leaderboard = build_season_champion_leaderboard(
             umpire_stats=self._umpire_stats_snapshot(),
             challenge_history=self._challenge_history_snapshot(),
+            home_plate_assignments=self._home_plate_games_snapshot(),
             season_year=local_now.year,
             as_of=local_now.date(),
         )
@@ -895,6 +994,7 @@ class AbsBotService:
         set[str],
         dict[str, Dict[str, Any]],
         list[Dict[str, Any]],
+        dict[str, Dict[str, Any]],
         dict[str, Set[str]],
         dict[str, Dict[str, Any]],
         dict[str, str],
@@ -903,17 +1003,19 @@ class AbsBotService:
         str | None,
         str | None,
         str | None,
+        str | None,
+        str | None,
     ]:
         if not self.state_file.exists():
-            return set(), {}, [], {}, {}, {}, set(), {}, None, None, None
+            return set(), {}, [], {}, {}, {}, set(), {}, None, None, None, None, None
         try:
             payload = json.loads(self.state_file.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
-            return set(), {}, [], {}, {}, {}, set(), {}, None, None, None
+            return set(), {}, [], {}, {}, {}, set(), {}, None, None, None, None, None
         if isinstance(payload, list):
-            return {str(item) for item in payload}, {}, [], {}, {}, {}, set(), {}, None, None, None
+            return {str(item) for item in payload}, {}, [], {}, {}, {}, set(), {}, None, None, None, None, None
         if not isinstance(payload, dict):
-            return set(), {}, [], {}, {}, {}, set(), {}, None, None, None
+            return set(), {}, [], {}, {}, {}, set(), {}, None, None, None, None, None
 
         payload_version = int(payload.get("state_version", 0) or 0)
         seen_ids: set[str] = set()
@@ -957,6 +1059,18 @@ class AbsBotService:
                         "reasonable_attempt": entry.get("reasonable_attempt"),
                     }
                 )
+        home_plate_games: dict[str, Dict[str, Any]] = {}
+        home_plate_games_payload = payload.get("home_plate_games", {})
+        if isinstance(home_plate_games_payload, dict):
+            for game_pk, entry in home_plate_games_payload.items():
+                if not game_pk or not isinstance(entry, dict):
+                    continue
+                home_plate_games[str(game_pk)] = {
+                    "game_pk": int(entry.get("game_pk", 0) or 0),
+                    "game_date": str(entry.get("game_date", "")),
+                    "umpire_key": str(entry.get("umpire_key", "")),
+                    "umpire_name": str(entry.get("umpire_name", "")),
+                }
         publisher_delivery: dict[str, Set[str]] = {}
         delivery_payload = payload.get("publisher_delivery", {})
         if isinstance(delivery_payload, dict):
@@ -998,6 +1112,14 @@ class AbsBotService:
                 if not play_id or not isinstance(row, dict):
                     continue
                 savant_challenges[str(play_id)] = dict(row)
+        last_home_plate_games_sync_local_date = None
+        raw_hp_sync_local_date = payload.get("last_home_plate_games_sync_local_date")
+        if raw_hp_sync_local_date:
+            last_home_plate_games_sync_local_date = str(raw_hp_sync_local_date)
+        last_home_plate_games_sync_at = None
+        raw_hp_sync_at = payload.get("last_home_plate_games_sync_at")
+        if raw_hp_sync_at:
+            last_home_plate_games_sync_at = str(raw_hp_sync_at)
         last_savant_sync_local_date = None
         raw_sync_local_date = payload.get("last_savant_sync_local_date")
         if raw_sync_local_date:
@@ -1014,11 +1136,14 @@ class AbsBotService:
             seen_ids,
             umpire_stats,
             challenge_history,
+            home_plate_games,
             publisher_delivery,
             pending_clip_lookups,
             seen_clip_urls,
             seen_summary_ids,
             savant_challenges,
+            last_home_plate_games_sync_local_date,
+            last_home_plate_games_sync_at,
             last_savant_sync_local_date,
             last_savant_sync_at,
             last_savant_data_through,
@@ -1033,6 +1158,7 @@ class AbsBotService:
                     "seen_challenge_ids": sorted(self.seen_challenge_ids),
                     "umpire_stats": self.umpire_stats,
                     "challenge_history": self.challenge_history,
+                    "home_plate_games": self.home_plate_games,
                     "publisher_delivery": {
                         key: sorted(value)
                         for key, value in self.publisher_delivery.items()
@@ -1041,6 +1167,8 @@ class AbsBotService:
                     "seen_clip_urls": self.seen_clip_urls,
                     "seen_summary_ids": sorted(self.seen_summary_ids),
                     "savant_challenges": self.savant_challenges,
+                    "last_home_plate_games_sync_local_date": self.last_home_plate_games_sync_local_date,
+                    "last_home_plate_games_sync_at": self.last_home_plate_games_sync_at,
                     "last_savant_sync_local_date": self.last_savant_sync_local_date,
                     "last_savant_sync_at": self.last_savant_sync_at,
                     "last_savant_data_through": self.last_savant_data_through,
@@ -1068,6 +1196,10 @@ class AbsBotService:
     def _challenge_history_snapshot(self) -> list[Dict[str, Any]]:
         with self.state_lock:
             return [dict(entry) for entry in self.challenge_history]
+
+    def _home_plate_games_snapshot(self) -> list[Dict[str, Any]]:
+        with self.state_lock:
+            return [dict(entry) for entry in self.home_plate_games.values()]
 
     def _known_challenge_play_ids(self) -> set[str]:
         with self.state_lock:
@@ -1216,6 +1348,102 @@ class AbsBotService:
                 "reasonable_attempt": savant_row.get("reasonable_attempt") if savant_row else None,
             }
         )
+
+    def _record_home_plate_assignment_from_feed(
+        self,
+        *,
+        game: Dict[str, Any] | None,
+        feed: Dict[str, Any],
+        fallback_game_date: str | None = None,
+    ) -> bool:
+        assignment = self._build_home_plate_assignment(
+            game=game,
+            feed=feed,
+            fallback_game_date=fallback_game_date,
+        )
+        if assignment is None:
+            return False
+        assignment_key, assignment_value = assignment
+        with self.state_lock:
+            changed = self._store_home_plate_assignment_unlocked(assignment_key, assignment_value)
+            if changed:
+                self._save_state()
+        if changed:
+            logger.info(
+                "Recorded HP assignment for game %s: %s",
+                assignment_key,
+                assignment_value.get("umpire_name", ""),
+            )
+        return changed
+
+    def _build_home_plate_assignment(
+        self,
+        *,
+        game: Dict[str, Any] | None,
+        feed: Dict[str, Any],
+        fallback_game_date: str | None = None,
+    ) -> tuple[str, Dict[str, Any]] | None:
+        umpire_id, umpire_name = extract_home_plate_umpire(feed)
+        umpire_name = str(umpire_name or "").strip()
+        if umpire_id is None and not umpire_name:
+            return None
+        umpire_key = f"id:{umpire_id}" if umpire_id is not None else f"name:{umpire_name.lower()}"
+        game_pk = int(
+            (game or {}).get("gamePk", 0)
+            or feed.get("gamePk")
+            or feed.get("gameData", {}).get("game", {}).get("pk")
+            or 0
+        )
+        if not game_pk:
+            return None
+        local_game_date = (
+            self._game_local_date(game).isoformat()
+            if game is not None and self._game_local_date(game) is not None
+            else self._feed_local_game_date(feed)
+        )
+        if not local_game_date:
+            local_game_date = str(fallback_game_date or "").strip()
+        if not local_game_date:
+            return None
+        return (
+            str(game_pk),
+            {
+                "game_pk": game_pk,
+                "game_date": local_game_date,
+                "umpire_key": umpire_key,
+                "umpire_name": umpire_name or "Unknown",
+            },
+        )
+
+    def _store_home_plate_assignment_unlocked(
+        self,
+        game_pk_key: str,
+        assignment: Dict[str, Any],
+    ) -> bool:
+        existing = self.home_plate_games.get(game_pk_key)
+        if existing == assignment:
+            return False
+        self.home_plate_games[game_pk_key] = dict(assignment)
+        return True
+
+    def _feed_local_game_date(self, feed: Dict[str, Any]) -> str | None:
+        datetime_data = feed.get("gameData", {}).get("datetime", {})
+        for key in ("officialDate", "originalDate"):
+            value = str(datetime_data.get(key, "")).strip()
+            if value:
+                return value
+        raw_datetime = datetime_data.get("dateTime")
+        if not raw_datetime:
+            return None
+        try:
+            return (
+                datetime.fromisoformat(str(raw_datetime).replace("Z", "+00:00"))
+                .astimezone(self.local_tz)
+                .date()
+                .isoformat()
+            )
+        except ValueError:
+            return None
 
     @staticmethod
     def _umpire_state_key(challenge: Any) -> str | None:

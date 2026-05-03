@@ -25,7 +25,7 @@ DISPLAY_ZONE_WIDTH_INCHES = 17.0
 def extract_abs_challenges(feed: Dict[str, Any]) -> List[AbsChallenge]:
     teams = _extract_teams(feed)
     player_heights = _extract_player_heights(feed)
-    home_plate_umpire_id, home_plate_umpire_name = _extract_home_plate_umpire(feed)
+    home_plate_umpire_id, home_plate_umpire_name = extract_home_plate_umpire(feed)
     game_pk = int(feed.get("gamePk") or feed.get("gameData", {}).get("game", {}).get("pk") or 0)
     game_status = (
         feed.get("gameData", {})
@@ -140,6 +140,11 @@ def format_post_text(challenge: AbsChallenge) -> str:
     if challenge.at_bat_result_display:
         lines.append(challenge.at_bat_result_display)
     return "\n".join(lines)
+
+
+def extract_home_plate_umpire(feed: Dict[str, Any]) -> Tuple[Optional[int], str]:
+    """Return the game feed's home plate umpire id/name pair when available."""
+    return _extract_home_plate_umpire(feed)
 
 
 def format_bluesky_post_text(challenge: AbsChallenge) -> str:

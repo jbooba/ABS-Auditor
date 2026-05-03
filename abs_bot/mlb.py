@@ -64,6 +64,25 @@ class MlbStatsApiClient:
         logger.debug("Collected %s unique game(s) for dates=%s", len(games), date_list)
         return games
 
+    def schedule_for_range(self, start_date: str, end_date: str) -> List[Dict[str, Any]]:
+        query = urlencode({"sportId": 1, "startDate": start_date, "endDate": end_date})
+        data = self.fetch_json(f"https://statsapi.mlb.com/api/v1/schedule?{query}")
+        games: List[Dict[str, Any]] = []
+        seen: Set[int] = set()
+        for day in data.get("dates", []):
+            for game in day.get("games", []):
+                game_pk = int(game.get("gamePk", 0))
+                if game_pk and game_pk not in seen:
+                    seen.add(game_pk)
+                    games.append(game)
+        logger.debug(
+            "Collected %s unique game(s) for range=%s..%s",
+            len(games),
+            start_date,
+            end_date,
+        )
+        return games
+
     def fetch_live_game_feed(self, game_pk: int) -> Dict[str, Any]:
         urls = [
             f"https://statsapi.mlb.com/api/v1.1/game/{game_pk}/feed/live",

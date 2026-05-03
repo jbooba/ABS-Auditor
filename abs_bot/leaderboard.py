@@ -57,6 +57,7 @@ SUMMARY_CARD_HOT = "#fce8d5"
 class UmpireStanding:
     key: str
     name: str
+    home_plate_games: int
     total: int
     confirmed: int
     overturned: int
@@ -230,6 +231,7 @@ def build_umpire_standings(
     umpire_stats: dict[str, dict],
     *,
     challenge_history: Iterable[dict[str, Any]] = (),
+    home_plate_assignments: Iterable[dict[str, Any]] = (),
     as_of: date | None = None,
     include_momentum: bool = True,
 ) -> tuple[UmpireStanding, ...]:
@@ -238,6 +240,7 @@ def build_umpire_standings(
     league_average = _league_average(umpire_stats)
     recent_stats = _recent_stats_by_umpire(challenge_history, as_of=as_of)
     difficulty_averages = _difficulty_average_by_umpire(challenge_history)
+    home_plate_games = _home_plate_games_by_umpire(home_plate_assignments, as_of=as_of)
 
     standings: list[UmpireStanding] = []
     for key, value in umpire_stats.items():
@@ -270,6 +273,7 @@ def build_umpire_standings(
             UmpireStanding(
                 key=str(key),
                 name=name,
+                home_plate_games=int(home_plate_games.get(str(key), 0) or 0),
                 total=total,
                 confirmed=confirmed,
                 overturned=overturned,
@@ -302,12 +306,14 @@ def build_weekly_leaderboard(
     *,
     umpire_stats: dict[str, dict],
     challenge_history: Iterable[dict[str, Any]] = (),
+    home_plate_assignments: Iterable[dict[str, Any]] = (),
     week_start: date,
     week_end: date,
 ) -> UmpireLeaderboard:
     standings = build_umpire_standings(
         umpire_stats,
         challenge_history=challenge_history,
+        home_plate_assignments=home_plate_assignments,
         as_of=week_end,
         include_momentum=True,
     )
@@ -331,12 +337,14 @@ def build_season_champion_leaderboard(
     *,
     umpire_stats: dict[str, dict],
     challenge_history: Iterable[dict[str, Any]] = (),
+    home_plate_assignments: Iterable[dict[str, Any]] = (),
     season_year: int,
     as_of: date | None = None,
 ) -> UmpireLeaderboard:
     standings = build_umpire_standings(
         umpire_stats,
         challenge_history=challenge_history,
+        home_plate_assignments=home_plate_assignments,
         as_of=as_of,
         include_momentum=False,
     )
@@ -523,7 +531,7 @@ def _best_all_around_card(standings: tuple[UmpireStanding, ...]) -> tuple[str, t
         (
             leader.name,
             f"Power {leader.abs_power_score:.1f} | Upheld {leader.upheld_percent:.1f}%",
-            f"Record {leader.record_display} on {leader.total} challenges",
+            f"Record {leader.record_display} on {leader.total} challenges | {leader.home_plate_games} HP games",
         ),
         SUMMARY_CARD_BG,
     )
@@ -538,7 +546,7 @@ def _safest_leader_card(standings: tuple[UmpireStanding, ...]) -> tuple[str, tup
         (
             safest.name,
             f"Wilson floor {safest.wilson_percent:.1f}% | Bayes {safest.bayes_percent:.1f}%",
-            f"Record {safest.record_display} on {safest.total} challenges",
+            f"Record {safest.record_display} on {safest.total} challenges | {safest.home_plate_games} HP games",
         ),
         SUMMARY_CARD_ALT,
     )
@@ -561,7 +569,7 @@ def _hottest_ump_card(standings: tuple[UmpireStanding, ...]) -> tuple[str, tuple
         (
             hottest.name,
             f"Momentum {hottest.momentum_display} | Last 14d {hottest.recent_record_display}",
-            f"Season record {hottest.record_display} on {hottest.total} challenges",
+            f"Season record {hottest.record_display} on {hottest.total} challenges | {hottest.home_plate_games} HP games",
         ),
         SUMMARY_CARD_HOT,
     )
@@ -575,7 +583,7 @@ def _workhorse_card(standings: tuple[UmpireStanding, ...]) -> tuple[str, tuple[s
         "WORKHORSE",
         (
             workhorse.name,
-            f"Most challenged: {workhorse.total} | Record {workhorse.record_display}",
+            f"Most challenged: {workhorse.total} across {workhorse.home_plate_games} HP games",
             f"Upheld {workhorse.upheld_percent:.1f}% | Power {workhorse.abs_power_score:.1f}",
         ),
         TABLE_MOST_CHALLENGED,
@@ -638,7 +646,8 @@ def _draw_table_headers(draw: "ImageDraw.ImageDraw", font, *, column_left: float
         ("HP Umpire", columns["name"]),
         ("Upheld%", columns["rate"]),
         ("Record", columns["record"]),
-        ("Total", columns["total"]),
+        ("Chal", columns["total"]),
+        ("HP G", columns["games"]),
     ]
     for label, x in headers:
         draw.text((x, column_top + 12), label, fill="#ffffff", font=font)
@@ -660,15 +669,17 @@ def _draw_standing_row(
     draw.text((columns["rate"], row_top + 7), f"{standing.upheld_percent:.1f}%", fill=CARD_OUTLINE, font=font)
     draw.text((columns["record"], row_top + 7), standing.record_display, fill=CARD_OUTLINE, font=font)
     draw.text((columns["total"], row_top + 7), str(standing.total), fill=CARD_OUTLINE, font=font)
+    draw.text((columns["games"], row_top + 7), str(standing.home_plate_games), fill=CARD_OUTLINE, font=font)
 
 
 def _column_positions(column_left: float, column_width: float) -> dict[str, float]:
     return {
         "rank": column_left + 18,
-        "name": column_left + 88,
-        "rate": column_left + (column_width * 0.61),
-        "record": column_left + (column_width * 0.775),
-        "total": column_left + (column_width * 0.905),
+        "name": column_left + 112,
+        "rate": column_left + (column_width * 0.58),
+        "record": column_left + (column_width * 0.72),
+        "total": column_left + (column_width * 0.84),
+        "games": column_left + (column_width * 0.93),
     }
 
 
@@ -766,6 +777,25 @@ def _difficulty_average_by_umpire(
         for key in totals.keys()
         if counts.get(key, 0) > 0
     }
+
+
+def _home_plate_games_by_umpire(
+    home_plate_assignments: Iterable[dict[str, Any]],
+    *,
+    as_of: date,
+) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for entry in home_plate_assignments:
+        if not isinstance(entry, dict):
+            continue
+        umpire_key = str(entry.get("umpire_key", "")).strip()
+        if not umpire_key:
+            continue
+        game_date = _history_entry_date(entry.get("game_date"))
+        if game_date is None or game_date > as_of:
+            continue
+        counts[umpire_key] = counts.get(umpire_key, 0) + 1
+    return counts
 
 
 def _history_entry_date(raw_value: Any) -> date | None:
